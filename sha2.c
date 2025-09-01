@@ -14,6 +14,14 @@
 #include <string.h>
 #include <inttypes.h>
 
+/* cpunet string data */
+static const uint32_t cpunet_block2_part[] = {
+	0x6e757063, /* "cpun" */
+	0x80007465, /* "et" + null + padding */
+};
+static const uint32_t cpunet_preimage_len_bits = 87 * 8;
+
+
 #if defined(USE_ASM) && \
 	(defined(__x86_64__) || \
 	 (defined(__arm__) && defined(__APCS_32__)) || \
@@ -483,7 +491,15 @@ static inline int scanhash_sha256d_4way(int thr_id, uint32_t *pdata,
 	const uint32_t Htarg = ptarget[7];
 	int i, j;
 	
-	memcpy(data, pdata + 16, 64);
+	uint32_t block2[16];
+	memcpy(block2, pdata + 16, 16);
+	block2[4] = cpunet_block2_part[0];
+	block2[5] = cpunet_block2_part[1];
+	memset(block2 + 6, 0, (14 - 6) * sizeof(uint32_t));
+	block2[14] = 0;
+	block2[15] = cpunet_preimage_len_bits;
+	
+	memcpy(data, block2, 64);
 	sha256d_preextend(data);
 	for (i = 31; i >= 0; i--)
 		for (j = 0; j < 4; j++)
@@ -492,7 +508,7 @@ static inline int scanhash_sha256d_4way(int thr_id, uint32_t *pdata,
 	sha256_init(midstate);
 	sha256_transform(midstate, pdata, 0);
 	memcpy(prehash, midstate, 32);
-	sha256d_prehash(prehash, pdata + 16);
+	sha256d_prehash(prehash, block2);
 	for (i = 7; i >= 0; i--) {
 		for (j = 0; j < 4; j++) {
 			midstate[i * 4 + j] = midstate[i];
@@ -542,7 +558,15 @@ static inline int scanhash_sha256d_8way(int thr_id, uint32_t *pdata,
 	const uint32_t Htarg = ptarget[7];
 	int i, j;
 	
-	memcpy(data, pdata + 16, 64);
+	uint32_t block2[16];
+	memcpy(block2, pdata + 16, 16);
+	block2[4] = cpunet_block2_part[0];
+	block2[5] = cpunet_block2_part[1];
+	memset(block2 + 6, 0, (14 - 6) * sizeof(uint32_t));
+	block2[14] = 0;
+	block2[15] = cpunet_preimage_len_bits;
+	
+	memcpy(data, block2, 64);
 	sha256d_preextend(data);
 	for (i = 31; i >= 0; i--)
 		for (j = 0; j < 8; j++)
@@ -551,7 +575,7 @@ static inline int scanhash_sha256d_8way(int thr_id, uint32_t *pdata,
 	sha256_init(midstate);
 	sha256_transform(midstate, pdata, 0);
 	memcpy(prehash, midstate, 32);
-	sha256d_prehash(prehash, pdata + 16);
+	sha256d_prehash(prehash, block2);
 	for (i = 7; i >= 0; i--) {
 		for (j = 0; j < 8; j++) {
 			midstate[i * 8 + j] = midstate[i];
@@ -605,14 +629,22 @@ int scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
 		return scanhash_sha256d_4way(thr_id, pdata, ptarget,
 			max_nonce, hashes_done);
 #endif
+
+	uint32_t block2[16];
+	memcpy(block2, pdata + 16, 16);
+	block2[4] = cpunet_block2_part[0];
+	block2[5] = cpunet_block2_part[1];
+	memset(block2 + 6, 0, (14 - 6) * sizeof(uint32_t));
+	block2[14] = 0;
+	block2[15] = cpunet_preimage_len_bits;
 	
-	memcpy(data, pdata + 16, 64);
+	memcpy(data, block2, 64);
 	sha256d_preextend(data);
 	
 	sha256_init(midstate);
 	sha256_transform(midstate, pdata, 0);
 	memcpy(prehash, midstate, 32);
-	sha256d_prehash(prehash, pdata + 16);
+	sha256d_prehash(prehash, block2);
 	
 	do {
 		data[3] = ++n;
