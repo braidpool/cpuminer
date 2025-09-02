@@ -26,6 +26,7 @@
 #include <jansson.h>
 #include <curl/curl.h>
 #include <time.h>
+#include <math.h>
 #if defined(WIN32)
 #include <winsock2.h>
 #include <mstcpip.h>
@@ -77,7 +78,7 @@ void applog(int prio, const char *fmt, ...)
 		va_list ap2;
 		char *buf;
 		int len;
-		
+
 		va_copy(ap2, ap);
 		len = vsnprintf(NULL, 0, fmt, ap2) + 1;
 		va_end(ap2);
@@ -840,7 +841,7 @@ bool fulltest(const uint32_t *hash, const uint32_t *target)
 {
 	int i;
 	bool rc = true;
-	
+
 	for (i = 7; i >= 0; i--) {
 		if (hash[i] > target[i]) {
 			rc = false;
@@ -852,10 +853,11 @@ bool fulltest(const uint32_t *hash, const uint32_t *target)
 		}
 	}
 
+        /*
 	if (opt_debug) {
 		uint32_t hash_be[8], target_be[8];
 		char hash_str[65], target_str[65];
-		
+
 		for (i = 0; i < 8; i++) {
 			be32enc(hash_be + i, hash[7 - i]);
 			be32enc(target_be + i, target[7 - i]);
@@ -869,6 +871,7 @@ bool fulltest(const uint32_t *hash, const uint32_t *target)
 			hash_str,
 			target_str);
 	}
+        */
 
 	return rc;
 }
@@ -877,7 +880,7 @@ void diff_to_target(uint32_t *target, double diff)
 {
 	uint64_t m;
 	int k;
-	
+
 	for (k = 6; k > 0 && diff > 1.0; k--)
 		diff /= 4294967296.0;
 	m = 4294901760.0 / diff;
@@ -890,6 +893,39 @@ void diff_to_target(uint32_t *target, double diff)
 	}
 }
 
+/* Convert a floating-point difficulty into a Bitcoin compact target (u64).
+ * Uses the classic difficulty-one target 0x1d00ffff as the baseline and
+ * computes an approximate compact for target = target1 / diff.
+ * Returns the compact bits in the low 32 bits of the u64. */
+uint64_t diff_to_compact_u64(double diff)
+{
+    if (diff <= 0.0)
+        return 0;
+
+    const int E1 = 0x1d;           /* exponent of difficulty-one */
+    const long double M1 = 65535.0L;/* mantissa of difficulty-one */
+    long double mant = M1 / (long double)diff;
+    int e = E1;
+
+    /* Normalize mantissa into 3-byte range [2^15, 2^23) ~ [32768, 8388608) */
+    while (mant > 0.0L && mant < (long double)(0x800000 / 256)) {
+        mant *= 256.0L;
+        e -= 1;
+        if (e <= 0)
+            break;
+    }
+    while (mant >= (long double)0x800000) {
+        mant /= 256.0L;
+        e += 1;
+        if (e >= 255)
+            break;
+    }
+
+    uint32_t m = (uint32_t) (mant <= 0.0L ? 0 : (mant >= (long double)0xFFFFFF ? 0xFFFFFF : (uint32_t)mant));
+    uint32_t bits = ((uint32_t)e << 24) | (m & 0x007fffff);
+    return (uint64_t)bits;
+}
+
 #ifdef WIN32
 #define socket_blocks() (WSAGetLastError() == WSAEWOULDBLOCK)
 #else
@@ -898,37 +934,50 @@ void diff_to_target(uint32_t *target, double diff)
 
 static bool send_line(struct stratum_ctx *sctx, char *s)
 {
-	ssize_t len, sent = 0;
-	
-	len = strlen(s);
-	s[len++] = '\n';
+    /* Do not write into caller's buffer; append newline in a temp buffer. */
+    size_t slen = strlen(s);
+    size_t len = slen + 1; /* include trailing \n */
+    char *buf = malloc(len);
+    ssize_t sent = 0;
+    if (!buf)
+        return false;
+    memcpy(buf, s, slen);
+    buf[slen] = '\n';
 
-	while (len > 0) {
-		struct timeval timeout = {0, 0};
-		ssize_t n;
-		fd_set wd;
+    while (len > 0) {
+        struct timeval timeout = {0, 0};
+        ssize_t n;
+        fd_set wd;
 
-		FD_ZERO(&wd);
-		FD_SET(sctx->sock, &wd);
-		if (select(sctx->sock + 1, NULL, &wd, NULL, &timeout) < 1)
-			return false;
+        FD_ZERO(&wd);
+        FD_SET(sctx->sock, &wd);
+        if (select(sctx->sock + 1, NULL, &wd, NULL, &timeout) < 1) {
+            free(buf);
+            return false;
+        }
 #if LIBCURL_VERSION_NUM >= 0x071202
-		CURLcode rc = curl_easy_send(sctx->curl, s + sent, len, (size_t *)&n);
-		if (rc != CURLE_OK) {
-			if (rc != CURLE_AGAIN)
+        CURLcode rc = curl_easy_send(sctx->curl, buf + sent, len, (size_t *)&n);
+        if (rc != CURLE_OK) {
+            if (rc != CURLE_AGAIN) {
+                free(buf);
+                return false;
+            }
 #else
-		n = send(sctx->sock, s + sent, len, 0);
-		if (n < 0) {
-			if (!socket_blocks())
+        n = send(sctx->sock, buf + sent, len, 0);
+        if (n < 0) {
+            if (!socket_blocks()) {
+                free(buf);
+                return false;
+            }
 #endif
-				return false;
-			n = 0;
-		}
-		sent += n;
-		len -= n;
-	}
+            n = 0;
+        }
+        sent += n;
+        len -= n;
+    }
 
-	return true;
+    free(buf);
+    return true;
 }
 
 bool stratum_send_line(struct stratum_ctx *sctx, char *s)
@@ -943,6 +992,40 @@ bool stratum_send_line(struct stratum_ctx *sctx, char *s)
 	pthread_mutex_unlock(&sctx->sock_lock);
 
 	return ret;
+}
+
+/* Convert compact bits (Bitcoin) to relative difficulty (difficulty-1 baseline). */
+static inline double compact_to_diff(uint32_t bits)
+{
+    /* bits: [exp (8)] [mantissa (24)] */
+    int e = (bits >> 24) & 0xff;
+    uint32_t m = bits & 0x007fffff; /* ignore sign bit */
+    if (m == 0)
+        return 0.0;
+    const int E1 = 0x1d;
+    const double M1 = 65535.0; /* 0x00ffff */
+    int shift = 8 * (E1 - e);
+    /* diff = (M1/m) * 2^(8*(E1-e)) */
+    return (M1 / (double)m) * ldexp(1.0, shift);
+}
+
+/* Convert compact bits into 32-byte big-endian target, then into 8x uint32 words
+ * comparable by fulltest() (target[7] is the most significant word). */
+void compact_to_target_words(uint32_t bits, uint32_t target[8])
+{
+    unsigned char tbytes[32];
+    memset(tbytes, 0, sizeof(tbytes));
+    int e = (bits >> 24) & 0xff;
+    uint32_t m = bits & 0x007fffff;
+    /* place 3-byte mantissa at offset (32 - e) */
+    int offset = 32 - e;
+    if (offset < 0) offset = 0;
+    if (offset > 29) offset = 29;
+    tbytes[offset + 0] = (m >> 16) & 0xff;
+    tbytes[offset + 1] = (m >> 8) & 0xff;
+    tbytes[offset + 2] = (m >> 0) & 0xff;
+    for (int i = 0; i < 8; i++)
+        target[7 - i] = be32dec(tbytes + 4 * i);
 }
 
 static bool socket_full(curl_socket_t sock, int timeout)
@@ -1388,11 +1471,22 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	hex2bin(sctx->job.version, version, 4);
 	hex2bin(sctx->job.nbits, nbits, 4);
 	hex2bin(sctx->job.ntime, ntime, 4);
-	sctx->job.clean = clean;
+    sctx->job.clean = clean;
 
-	sctx->job.diff = sctx->next_diff;
+    /* Use compact share target if provided, else legacy diff */
+    sctx->job.compact_bits = sctx->next_bits;
+    sctx->job.diff = sctx->next_diff;
 
-	pthread_mutex_unlock(&sctx->work_lock);
+    pthread_mutex_unlock(&sctx->work_lock);
+
+    if (opt_debug) {
+        uint32_t nbits_be;
+        memcpy(&nbits_be, sctx->job.nbits, 4);
+        uint32_t bits = be32dec(&nbits_be);
+        applog(LOG_DEBUG, "NOTIFY: job=%s clean=%d bits(hex)=%08x compact_bits=%08x merkle=%d",
+               sctx->job.job_id ? sctx->job.job_id : "(null)",
+               sctx->job.clean, bits, sctx->job.compact_bits, sctx->job.merkle_count);
+    }
 
 	ret = true;
 
@@ -1402,18 +1496,32 @@ out:
 
 static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
 {
-	double diff;
-
-	diff = json_number_value(json_array_get(params, 0));
-	if (diff == 0)
+	uint32_t bits = 0;
+	json_t *p0 = json_array_get(params, 0);
+	if (json_is_integer(p0)) {
+		uint64_t v = (uint64_t)json_integer_value(p0);
+		bits = (uint32_t)(v & 0xffffffffu);
+	} else if (json_is_string(p0)) {
+		const char *s = json_string_value(p0);
+		if (s) {
+			char *endp = NULL;
+			if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+				bits = (uint32_t)strtoul(s + 2, &endp, 16);
+			else
+				bits = (uint32_t)strtoul(s, &endp, 10);
+		}
+	}
+	if (!bits)
 		return false;
 
+	double diff = compact_to_diff(bits);
 	pthread_mutex_lock(&sctx->work_lock);
-	sctx->next_diff = diff;
+	sctx->next_bits = bits;
+	sctx->next_diff = diff; /* legacy */
 	pthread_mutex_unlock(&sctx->work_lock);
 
 	if (opt_debug)
-		applog(LOG_DEBUG, "Stratum difficulty set to %g", diff);
+		applog(LOG_DEBUG, "Stratum set_difficulty bits=0x%08x (diff≈%g)", bits, diff);
 
 	return true;
 }
@@ -1458,7 +1566,7 @@ static bool stratum_get_version(struct stratum_ctx *sctx, json_t *id)
 	char *s;
 	json_t *val;
 	bool ret;
-	
+
 	if (!id || json_is_null(id))
 		return false;
 
@@ -1483,7 +1591,7 @@ static bool stratum_show_message(struct stratum_ctx *sctx, json_t *id, json_t *p
 	val = json_array_get(params, 0);
 	if (val)
 		applog(LOG_NOTICE, "MESSAGE FROM SERVER: %s", json_string_value(val));
-	
+
 	if (!id || json_is_null(id))
 		return true;
 

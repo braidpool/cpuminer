@@ -13,6 +13,7 @@
 
 #include <string.h>
 #include <inttypes.h>
+#include <openssl/sha.h>
 
 /* cpunet string data */
 static const uint32_t cpunet_block2_part[] = {
@@ -21,11 +22,44 @@ static const uint32_t cpunet_block2_part[] = {
 };
 static const uint32_t cpunet_preimage_len_bits = 87 * 8;
 
+/* Build the full second 512-bit block for CPUNet hashing.
+ * Input:  pdata  - 80-byte header as 20 uint32_t words (little-endian miner layout)
+ * Output: block2 - 16 words representing the second 64-byte block:
+ *                  words [0..3]  = last 16 bytes of the 80-byte header
+ *                  words [4..5]  = "cpunet\0" + 0x80 pad bit
+ *                  words [6..13] = zeros
+ *                  word  [14]    = 0
+ *                  word  [15]    = total bit length (80+7 bytes = 696 bits)
+ */
+static inline void cpunet_build_block2(uint32_t *block2, const uint32_t *pdata)
+{
+	/* Copy header tail (words 16..19) into words 0..3 */
+	memcpy(block2, pdata + 16, 16); /* 16 bytes = 4 words */
+	/* Insert CPUNet marker and padding */
+	block2[4] = cpunet_block2_part[0];
+	block2[5] = cpunet_block2_part[1];
+	memset(block2 + 6, 0, (14 - 6) * sizeof(uint32_t));
+	block2[14] = 0;
+	block2[15] = cpunet_preimage_len_bits;
+}
+
+/* Serialize the 80-byte header and CPUNet marker into the canonical 87-byte
+ * preimage: header words are little-endian serialized, then "cpunet\0".
+ */
+static inline void cpunet_serialize_preimage(unsigned char *out87, const uint32_t *header20)
+{
+    for (int i = 0; i < 20; i++)
+        le32enc(out87 + 4 * i, header20[i]);
+    /* Append "cpunet" (6 bytes) and a trailing NUL (1 byte) */
+    memcpy(out87 + 80, "cpunet", 6);
+    out87[86] = 0x00;
+}
+
 
 #if defined(USE_ASM) && \
-	(defined(__x86_64__) || \
-	 (defined(__arm__) && defined(__APCS_32__)) || \
-	 (defined(__powerpc__) || defined(__ppc__) || defined(__PPC__)))
+    (defined(__x86_64__) || \
+     (defined(__arm__) && defined(__APCS_32__)) || \
+     (defined(__powerpc__) || defined(__ppc__) || defined(__PPC__)))
 #define EXTERN_SHA256
 #endif
 
@@ -207,6 +241,51 @@ static void sha256d_80_swap(uint32_t *hash, const uint32_t *data)
 		hash[i] = swab32(hash[i]);
 }
 
+static void openssl_sha256d(unsigned char *output, const unsigned char *input, size_t len)
+{
+	unsigned char intermediate[32];
+
+	// First SHA256
+	SHA256(input, len, intermediate);
+	// Second SHA256
+	SHA256(intermediate, 32, output);
+}
+
+static void cpunet_hash_simple(uint32_t *hash, const uint32_t *pdata)
+{
+	unsigned char preimage[87];
+	unsigned char openssl_hash[32];
+	unsigned char ours_bytes[32];
+	uint32_t ours_words[8];
+
+	/* Build canonical 87-byte preimage */
+	cpunet_serialize_preimage(preimage, pdata);
+
+	/* Compute SHA256d using both implementations */
+	openssl_sha256d(openssl_hash, preimage, sizeof(preimage));
+	sha256d(ours_bytes, preimage, sizeof(preimage));
+
+	/* Convert OpenSSL bytes to little-endian word values expected by fulltest */
+	for (int i = 0; i < 8; i++)
+		hash[i] = swab32(be32dec(openssl_hash + i * 4));
+
+	/* Optional debug cross-check */
+	if (opt_debug) {
+		for (int i = 0; i < 8; i++)
+			ours_words[i] = swab32(be32dec(ours_bytes + i * 4));
+		bool same = true;
+		for (int i = 0; i < 8; i++) if (hash[i] != ours_words[i]) { same = false; break; }
+		if (!same) {
+			printf("WARNING: OpenSSL and internal sha256d mismatch on CPUNet preimage\n");
+			printf("OpenSSL: ");
+			for (int i = 0; i < 8; i++) printf("%08x", hash[i]);
+			printf("\nInternal: ");
+			for (int i = 0; i < 8; i++) printf("%08x", ours_words[i]);
+			printf("\n");
+		}
+	}
+}
+
 void sha256d(unsigned char *hash, const unsigned char *data, int len)
 {
 	uint32_t S[16], T[16];
@@ -368,7 +447,7 @@ static inline void sha256d_ms(uint32_t *hash, uint32_t *W,
 
 	for (i = 0; i < 8; i++)
 		S[i] += midstate[i];
-	
+
 	W[18] = S[18];
 	W[19] = S[19];
 	W[20] = S[20];
@@ -377,7 +456,7 @@ static inline void sha256d_ms(uint32_t *hash, uint32_t *W,
 	W[24] = S[24];
 	W[30] = S[30];
 	W[31] = S[31];
-	
+
 	memcpy(S + 8, sha256d_hash1 + 8, 32);
 	S[16] = s1(sha256d_hash1[14]) + sha256d_hash1[ 9] + s0(S[ 1]) + S[ 0];
 	S[17] = s1(sha256d_hash1[15]) + sha256d_hash1[10] + s0(S[ 2]) + S[ 1];
@@ -460,7 +539,7 @@ static inline void sha256d_ms(uint32_t *hash, uint32_t *W,
 	RNDr(hash, S, 54);
 	RNDr(hash, S, 55);
 	RNDr(hash, S, 56);
-	
+
 	hash[2] += hash[6] + S1(hash[3]) + Ch(hash[3], hash[4], hash[5])
 	         + S[57] + sha256_k[57];
 	hash[1] += hash[5] + S1(hash[2]) + Ch(hash[2], hash[3], hash[4])
@@ -490,21 +569,16 @@ static inline int scanhash_sha256d_4way(int thr_id, uint32_t *pdata,
 	const uint32_t first_nonce = pdata[19];
 	const uint32_t Htarg = ptarget[7];
 	int i, j;
-	
-	uint32_t block2[16];
-	memcpy(block2, pdata + 16, 16);
-	block2[4] = cpunet_block2_part[0];
-	block2[5] = cpunet_block2_part[1];
-	memset(block2 + 6, 0, (14 - 6) * sizeof(uint32_t));
-	block2[14] = 0;
-	block2[15] = cpunet_preimage_len_bits;
-	
+
+    uint32_t block2[16];
+    cpunet_build_block2(block2, pdata);
+
 	memcpy(data, block2, 64);
 	sha256d_preextend(data);
 	for (i = 31; i >= 0; i--)
 		for (j = 0; j < 4; j++)
 			data[i * 4 + j] = data[i];
-	
+
 	sha256_init(midstate);
 	sha256_transform(midstate, pdata, 0);
 	memcpy(prehash, midstate, 32);
@@ -515,25 +589,40 @@ static inline int scanhash_sha256d_4way(int thr_id, uint32_t *pdata,
 			prehash[i * 4 + j] = prehash[i];
 		}
 	}
-	
+
 	do {
 		for (i = 0; i < 4; i++)
 			data[4 * 3 + i] = ++n;
-		
+
 		sha256d_ms_4way(hash, data, midstate, prehash);
-		
+
 		for (i = 0; i < 4; i++) {
 			if (swab32(hash[4 * 7 + i]) <= Htarg) {
+				printf("\nDEBUG: 4-way scan path found potential solution (lane %d)!\n", i);
+				printf("Scan path hash[%d][7]: %08x (swab32: %08x)\n", i, hash[4 * 7 + i], swab32(hash[4 * 7 + i]));
+				printf("Target Htarg:          %08x\n", Htarg);
+
 				pdata[19] = data[4 * 3 + i];
-				sha256d_80_swap(hash, pdata);
-				if (fulltest(hash, ptarget)) {
+				// Rebuild full header with CPUNet nonce
+				uint32_t work_header[20];
+				memcpy(work_header, pdata, 80);     // Copy full 80-byte header
+				work_header[19] = data[4 * 3 + i];  // Update nonce for this lane
+
+				printf("DEBUG: Now validating with cpunet_hash_simple...\n");
+				cpunet_hash_simple(&hash[8 * i], work_header);
+
+				printf("Final validation hash: ");
+				for (int j = 0; j < 8; j++) printf("%08x", swab32(hash[8 * i + j]));
+				printf("\n");
+
+				if (fulltest(&hash[8 * i], ptarget)) {
 					*hashes_done = n - first_nonce + 1;
 					return 1;
 				}
 			}
 		}
 	} while (n < max_nonce && !work_restart[thr_id].restart);
-	
+
 	*hashes_done = n - first_nonce + 1;
 	pdata[19] = n;
 	return 0;
@@ -557,21 +646,16 @@ static inline int scanhash_sha256d_8way(int thr_id, uint32_t *pdata,
 	const uint32_t first_nonce = pdata[19];
 	const uint32_t Htarg = ptarget[7];
 	int i, j;
-	
-	uint32_t block2[16];
-	memcpy(block2, pdata + 16, 16);
-	block2[4] = cpunet_block2_part[0];
-	block2[5] = cpunet_block2_part[1];
-	memset(block2 + 6, 0, (14 - 6) * sizeof(uint32_t));
-	block2[14] = 0;
-	block2[15] = cpunet_preimage_len_bits;
-	
+
+    uint32_t block2[16];
+    cpunet_build_block2(block2, pdata);
+
 	memcpy(data, block2, 64);
 	sha256d_preextend(data);
 	for (i = 31; i >= 0; i--)
 		for (j = 0; j < 8; j++)
 			data[i * 8 + j] = data[i];
-	
+
 	sha256_init(midstate);
 	sha256_transform(midstate, pdata, 0);
 	memcpy(prehash, midstate, 32);
@@ -582,25 +666,41 @@ static inline int scanhash_sha256d_8way(int thr_id, uint32_t *pdata,
 			prehash[i * 8 + j] = prehash[i];
 		}
 	}
-	
+
 	do {
 		for (i = 0; i < 8; i++)
 			data[8 * 3 + i] = ++n;
-		
+
 		sha256d_ms_8way(hash, data, midstate, prehash);
-		
+
 		for (i = 0; i < 8; i++) {
 			if (swab32(hash[8 * 7 + i]) <= Htarg) {
+				//printf("\nDEBUG: 8-way precheck hit (lane %d)\n", i);
+				//printf("Precheck top word:   %08x (be: %08x)\n", hash[8 * 7 + i], swab32(hash[8 * 7 + i]));
+				//printf("Target Htarg:        %08x\n", Htarg);
+
 				pdata[19] = data[8 * 3 + i];
-				sha256d_80_swap(hash, pdata);
-				if (fulltest(hash, ptarget)) {
+				// Rebuild full header with CPUNet nonce
+				uint32_t work_header[20];
+				memcpy(work_header, pdata, 80);     // Copy full 80-byte header
+				work_header[19] = data[8 * 3 + i];  // Update nonce for this lane
+
+				//printf("DEBUG: Now validating with cpunet_hash_simple...\n");
+				cpunet_hash_simple(&hash[8 * i], work_header);
+
+				//printf("Final validation hash: ");
+				//for (int j = 0; j < 8; j++) printf("%08x", swab32(hash[8 * i + j]));
+				//printf("\n");
+				//printf("Final top word:     %08x\n", swab32(hash[8 * i + 7]));
+
+				if (fulltest(&hash[8 * i], ptarget)) {
 					*hashes_done = n - first_nonce + 1;
 					return 1;
 				}
 			}
 		}
 	} while (n < max_nonce && !work_restart[thr_id].restart);
-	
+
 	*hashes_done = n - first_nonce + 1;
 	pdata[19] = n;
 	return 0;
@@ -618,7 +718,7 @@ int scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
 	uint32_t n = pdata[19] - 1;
 	const uint32_t first_nonce = pdata[19];
 	const uint32_t Htarg = ptarget[7];
-	
+
 #ifdef HAVE_SHA256_8WAY
 	if (sha256_use_8way())
 		return scanhash_sha256d_8way(thr_id, pdata, ptarget,
@@ -630,35 +730,50 @@ int scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
 			max_nonce, hashes_done);
 #endif
 
-	uint32_t block2[16];
-	memcpy(block2, pdata + 16, 16);
-	block2[4] = cpunet_block2_part[0];
-	block2[5] = cpunet_block2_part[1];
-	memset(block2 + 6, 0, (14 - 6) * sizeof(uint32_t));
-	block2[14] = 0;
-	block2[15] = cpunet_preimage_len_bits;
-	
+    uint32_t block2[16];
+    cpunet_build_block2(block2, pdata);
+
 	memcpy(data, block2, 64);
 	sha256d_preextend(data);
-	
+
 	sha256_init(midstate);
 	sha256_transform(midstate, pdata, 0);
 	memcpy(prehash, midstate, 32);
 	sha256d_prehash(prehash, block2);
-	
+
 	do {
 		data[3] = ++n;
 		sha256d_ms(hash, data, midstate, prehash);
-		if (swab32(hash[7]) <= Htarg) {
-			pdata[19] = data[3];
-			sha256d_80_swap(hash, pdata);
-			if (fulltest(hash, ptarget)) {
-				*hashes_done = n - first_nonce + 1;
-				return 1;
-			}
-		}
+        if (swab32(hash[7]) <= Htarg) {
+            printf("\nDEBUG: Scan path found potential solution!\n");
+            printf("Scan path hash[7]: %08x (swab32: %08x)\n", hash[7], swab32(hash[7]));
+            printf("Target Htarg:      %08x\n", Htarg);
+
+            // Print the full scan path result BEFORE we overwrite it
+            printf("Scan path full hash: ");
+            for (int j = 0; j < 8; j++) printf("%08x", swab32(hash[j]));
+            printf("\n");
+
+            pdata[19] = data[3];
+            // Rebuild full header with CPUNet nonce
+            uint32_t work_header[20];
+            memcpy(work_header, pdata, 80);   // Copy full 80-byte header
+            work_header[19] = data[3];        // Update nonce
+
+            printf("DEBUG: Now validating with cpunet_hash_simple...\n");
+            cpunet_hash_simple(hash, work_header);
+
+            printf("Final validation hash: ");
+            for (int j = 0; j < 8; j++) printf("%08x", swab32(hash[j]));
+            printf("\n");
+
+            if (fulltest(hash, ptarget)) {
+                *hashes_done = n - first_nonce + 1;
+                return 1;
+            }
+        }
 	} while (n < max_nonce && !work_restart[thr_id].restart);
-	
+
 	*hashes_done = n - first_nonce + 1;
 	pdata[19] = n;
 	return 0;

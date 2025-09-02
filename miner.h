@@ -206,20 +206,24 @@ extern int timeval_subtract(struct timeval *result, struct timeval *x,
 	struct timeval *y);
 extern bool fulltest(const uint32_t *hash, const uint32_t *target);
 extern void diff_to_target(uint32_t *target, double diff);
+extern uint64_t diff_to_compact_u64(double diff);
+extern void compact_to_target_words(uint32_t bits, uint32_t target[8]);
 
 struct stratum_job {
-	char *job_id;
-	unsigned char prevhash[32];
-	size_t coinbase_size;
-	unsigned char *coinbase;
-	unsigned char *xnonce2;
-	int merkle_count;
-	unsigned char **merkle;
-	unsigned char version[4];
-	unsigned char nbits[4];
-	unsigned char ntime[4];
-	bool clean;
-	double diff;
+    char *job_id;
+    unsigned char prevhash[32];
+    size_t coinbase_size;
+    unsigned char *coinbase;
+    unsigned char *xnonce2;
+    int merkle_count;
+    unsigned char **merkle;
+    unsigned char version[4];
+    unsigned char nbits[4];
+    unsigned char ntime[4];
+    uint32_t version_mask;
+    bool clean;
+    double diff;          /* legacy relative diff; may be derived from compact */
+    uint32_t compact_bits;/* share target in compact format, if provided */
 };
 
 struct stratum_ctx {
@@ -231,9 +235,10 @@ struct stratum_ctx {
 	curl_socket_t sock;
 	size_t sockbuf_size;
 	char *sockbuf;
-	pthread_mutex_t sock_lock;
+    pthread_mutex_t sock_lock;
 
-	double next_diff;
+    double next_diff;
+    uint32_t next_bits; /* compact difficulty requested by server */
 
 	char *session_id;
 	size_t xnonce1_size;
