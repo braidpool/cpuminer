@@ -154,6 +154,9 @@ void sha256_transform_8way(uint32_t *state, const uint32_t *block, int swap);
 extern int scanhash_sha256d(int thr_id, uint32_t *pdata,
 	const uint32_t *ptarget, uint32_t max_nonce, unsigned long *hashes_done);
 
+/* CPUNet self-check: verify fast-path hashing matches canonical 87-byte hashing. */
+int cpunet_selfcheck(void);
+
 extern unsigned char *scrypt_buffer_alloc(int N);
 extern int scanhash_scrypt(int thr_id, uint32_t *pdata,
 	unsigned char *scratchbuf, const uint32_t *ptarget,
@@ -188,6 +191,13 @@ extern pthread_mutex_t applog_lock;
 extern struct thr_info *thr_info;
 extern int longpoll_thr_id;
 extern int stratum_thr_id;
+
+/* Debug flags (defined in cpu-miner.c) */
+extern bool opt_debug_sample_canonical;
+extern bool opt_debug_lax_target;
+
+/* Miner-side instrumentation: record candidate hashes for diagnostics */
+void miner_report_candidate(int thr_id, const uint32_t *pdata, uint32_t nonce, uint32_t top_hint);
 extern struct work_restart *work_restart;
 
 #define JSON_RPC_LONGPOLL	(1 << 0)
@@ -199,6 +209,17 @@ extern json_t *json_rpc_call(CURL *curl, const char *url, const char *userpass,
 void memrev(unsigned char *p, size_t len);
 extern void bin2hex(char *s, const unsigned char *p, size_t len);
 extern char *abin2hex(const unsigned char *p, size_t len);
+
+/* Compare 256-bit values a and b in miner word order (hash[7] is msw).
+ * Returns nonzero if a <= b, 0 otherwise. */
+static inline int words_leq_256(const uint32_t *a, const uint32_t *b)
+{
+    for (int i = 7; i >= 0; --i) {
+        if (a[i] < b[i]) return 1;
+        if (a[i] > b[i]) return 0;
+    }
+    return 1;
+}
 extern bool hex2bin(unsigned char *p, const char *hexstr, size_t len);
 extern int varint_encode(unsigned char *p, uint64_t n);
 extern size_t address_to_script(unsigned char *out, size_t outsz, const char *addr);
@@ -265,5 +286,9 @@ extern bool tq_push(struct thread_q *tq, void *data);
 extern void *tq_pop(struct thread_q *tq, const struct timespec *abstime);
 extern void tq_freeze(struct thread_q *tq);
 extern void tq_thaw(struct thread_q *tq);
+
+/* CPUNet modifications */
+void cpunet_serialize_preimage(unsigned char *out87, const uint32_t *header20);
+void cpunet_build_block2(uint32_t *block2, const uint32_t *pdata);
 
 #endif /* __MINER_H__ */

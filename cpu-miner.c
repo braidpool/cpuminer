@@ -126,6 +126,8 @@ static bool opt_quiet = false;
 static int opt_retries = -1;
 static int opt_fail_pause = 30;
 int opt_timeout = 0;
+static int opt_stratum_idle_secs = 900;   /* disconnect idle threshold */
+static int opt_stratum_ping_secs = 60;    /* send ping if idle this long */
 static int opt_scantime = 5;
 static enum algos opt_algo = ALGO_SHA256D;
 static int opt_scrypt_n = 1024;
@@ -138,6 +140,8 @@ static char *opt_version_mask = NULL;
 static bool opt_suggest_difficulty = false;
 static bool difficulty_suggested = false;
 static double suggested_difficulty = 0.0;
+bool opt_debug_sample_canonical = false;
+bool opt_debug_lax_target = false;
 
 static int pk_script_size;
 static unsigned char pk_script[42];
@@ -181,6 +185,70 @@ static inline uint32_t scatter_bits(uint32_t val, uint32_t mask)
         bit <<= 1;
     }
     return out;
+}
+
+/* --- Diagnostics: track per-thread best hash and periodic logging --- */
+static uint32_t (*thr_best_header)[20];
+static uint32_t *thr_best_top_hint; /* top 32 bits (big endian) as a quick comparator */
+static unsigned char (*thr_best_digest_bytes)[32]; /* canonical CPUNet digest bytes */
+static bool *thr_best_set;
+static time_t g_last_best_log = 0;
+
+/* Return true if a <= b as 256-bit integers in miner word order (hash[7] msw). */
+/* use words_leq_256 from miner.h */
+
+/* Build canonical CPUNet digest from a header (20 words, miner layout). */
+static inline void cpunet_digest_from_header(const uint32_t *header20, uint32_t out_words[8])
+{
+    unsigned char preimage[87];
+    for (int i = 0; i < 20; i++)
+        le32enc(preimage + 4 * i, header20[i]);
+    memcpy(preimage + 80, "cpunet", 6);
+    preimage[86] = 0x00;
+    unsigned char out_bytes[32];
+    sha256d(out_bytes, preimage, sizeof(preimage));
+    for (int i = 0; i < 8; i++)
+        out_words[i] = swab32(be32dec(out_bytes + 4 * i));
+}
+
+static inline void cpunet_digest_bytes_from_header(const uint32_t *header20, unsigned char out_bytes[32])
+{
+    unsigned char preimage[87];
+    for (int i = 0; i < 20; i++)
+        le32enc(preimage + 4 * i, header20[i]);
+    memcpy(preimage + 80, "cpunet", 6);
+    preimage[86] = 0x00;
+    sha256d(out_bytes, preimage, sizeof(preimage));
+}
+
+void miner_report_candidate(int thr_id, const uint32_t *pdata, uint32_t nonce, uint32_t top_hint)
+{
+    if (!thr_best_header || thr_id < 0)
+        return;
+    /* Accept all top_hint values, including zero (very good) */
+
+    /* Compute canonical digest bytes */
+    uint32_t header_copy[20];
+    memcpy(header_copy, pdata, 80);
+    header_copy[19] = nonce;
+    unsigned char cand_bytes[32];
+    cpunet_digest_bytes_from_header(header_copy, cand_bytes);
+
+    if (opt_debug_sample_canonical) {
+        if (!thr_best_set[thr_id] || memcmp(cand_bytes, thr_best_digest_bytes[thr_id], 32) < 0) {
+            memcpy(thr_best_header[thr_id], header_copy, 80);
+            memcpy(thr_best_digest_bytes[thr_id], cand_bytes, 32);
+            thr_best_top_hint[thr_id] = top_hint;
+            thr_best_set[thr_id] = true;
+        }
+    } else {
+        if (!thr_best_set[thr_id] || top_hint < thr_best_top_hint[thr_id]) {
+            memcpy(thr_best_header[thr_id], header_copy, 80);
+            memcpy(thr_best_digest_bytes[thr_id], cand_bytes, 32);
+            thr_best_top_hint[thr_id] = top_hint;
+            thr_best_set[thr_id] = true;
+        }
+    }
 }
 
 #ifdef HAVE_GETOPT_LONG
@@ -231,9 +299,13 @@ static char const usage[] = "\nUsage: " PROGRAM_NAME " [OPTIONS]\nOptions:\n"
     "      --benchmark       run in offline benchmark mode\n"
     "  -c, --config=FILE     load a JSON-format configuration file\n"
     "  -V, --version         display version information and exit\n"
-    "      --version-mask=MASK hex mask for version rolling\n"
-    "      --suggest-difficulty  automatically suggest difficulty to pool\n"
-        "  -h, --help            display this help text and exit\n";
+	"      --version-mask=MASK hex mask for version rolling\n"
+	"      --suggest-difficulty  automatically suggest difficulty to pool\n"
+	"      --stratum-idle=N   idle seconds before reconnect (default: 900)\n"
+	"      --stratum-ping=N   ping interval seconds when idle (default: 60)\n"
+	"      --debug-sample-canonical  sample one canonical digest per batch for display\n"
+	"      --debug-lax-target    override share target to easy value (test submissions)\n"
+	"  -h, --help            display this help text and exit\n";
 
 static char const short_options[] =
 #ifndef WIN32
@@ -279,6 +351,10 @@ static struct option const options[] = {
     { "version", 0, NULL, 'V' },
     { "version-mask", 1, NULL, 1016 },
     { "suggest-difficulty", 0, NULL, 1017 },
+    { "stratum-idle", 1, NULL, 1018 },
+    { "stratum-ping", 1, NULL, 1019 },
+    { "debug-sample-canonical", 0, NULL, 1020 },
+    { "debug-lax-target", 0, NULL, 1021 },
     { 0, 0, 0, 0 }
 };
 
@@ -762,7 +838,8 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
         char ntimestr[9], noncestr[9], *xnonce2str, *req, version_hex[20] = "";
 
         if (work->version_mask) {
-            sprintf(version_hex, ", \"%08x\"", swab32(work->version_solution));
+            /* Stratum expects the full rolled version (big-endian hex), not just the mask delta */
+            sprintf(version_hex, ", \"%08x\"", swab32(work->data[0]));
         }
         le32enc(&ntime, work->data[17]);
         le32enc(&nonce, work->data[19]);
@@ -1478,14 +1555,50 @@ static void *miner_thread(void *userdata)
             applog(LOG_INFO, "thread %d: %lu hashes, %s khash/s",
                 thr_id, total_hashes_done, s);
         }
+
+        /* Periodically show full 256-bit target and global best recent hash.
+           Only thread 0 prints to avoid spam. */
+        if (thr_id == 0) {
+            time_t now_ts = time(NULL);
+            const int best_log_interval = 5; /* seconds */
+            if (now_ts - g_last_best_log >= best_log_interval) {
+                unsigned char target_be[32], best_be[32];
+                char target_hex[65];
+                char best_hex_or_none[65];
+                for (int wi = 0; wi < 8; wi++)
+                    be32enc((uint32_t *)(target_be + 4 * wi), work.target[7 - wi]);
+                bin2hex(target_hex, target_be, 32);
+                /* Aggregate best across all threads for this interval */
+                bool any = false;
+                unsigned char agg_best_bytes[32];
+                for (int ti = 0; ti < opt_n_threads; ++ti) {
+                    if (thr_best_set && thr_best_set[ti]) {
+                        unsigned char *cand_bytes = thr_best_digest_bytes[ti];
+                        if (!any || memcmp(cand_bytes, agg_best_bytes, 32) < 0)
+                            memcpy(agg_best_bytes, cand_bytes, 32);
+                        thr_best_set[ti] = false; /* reset */
+                        any = true;
+                    }
+                }
+                if (any) {
+                    bin2hex(best_hex_or_none, agg_best_bytes, 32);
+                } else {
+                    strcpy(best_hex_or_none, "(none)");
+                }
+                /* Print on separate lines for alignment */
+                //applog(LOG_INFO, "target: %s", target_hex);
+                applog(LOG_INFO, "best  : %s", best_hex_or_none);
+                g_last_best_log = now_ts;
+            }
+        }
         if (opt_benchmark && thr_id == opt_n_threads - 1) {
             double hashrate = 0.;
             for (i = 0; i < opt_n_threads && thr_hashrates[i]; i++)
                 hashrate += thr_hashrates[i];
-            if (i == opt_n_threads) {
-                sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * hashrate);
-                applog(LOG_INFO, "Total: %s khash/s", s);
-            }
+            //if (i == opt_n_threads) {
+            //    sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * hashrate);
+            //    applog(LOG_INFO, "Total: %s khash/s", s);
+            //}
         }
 
         /* if nonce found, submit work */
@@ -1636,7 +1749,8 @@ static bool stratum_handle_response(char *buf)
             const char *mask_str = json_string_value(mask_obj);
             if (mask_str) {
                 applog(LOG_INFO, "version-rolling enabled with mask %s", mask_str);
-                stratum.job.version_mask = strtoul(mask_str, NULL, 16);
+                /* Pools may send decimal or hex; use base 0 for auto-detect */
+                stratum.job.version_mask = strtoul(mask_str, NULL, 0);
             }
         }
         ret = true;
@@ -1669,6 +1783,8 @@ static void *stratum_thread(void *userdata)
 
     while (1) {
         int failures = 0;
+        time_t last_recv = time(NULL);
+        time_t last_ping = 0;
 
         while (!stratum.curl) {
             pthread_mutex_lock(&g_work_lock);
@@ -1693,14 +1809,14 @@ static void *stratum_thread(void *userdata)
                 opt_suggest_difficulty, suggested_difficulty, difficulty_suggested);
 
             if (opt_suggest_difficulty && !difficulty_suggested) {
-                uint64_t sd_compact;
+                double sd_value = 1.0;
                 if (suggested_difficulty > 0) {
-                    applog(LOG_INFO, "Suggesting new difficulty of %.4f", suggested_difficulty);
-                    sd_compact = diff_to_compact_u64(suggested_difficulty);
+                    //sd_value = suggested_difficulty;
+                    applog(LOG_INFO, "Suggesting new difficulty of %.4f", sd_value);
                 } else {
-                    /* Fallback: no measured hashrate; suggest diff=1 (0x1d00ffff) */
-                    sd_compact = 0x1d00ffffu;
-                    applog(LOG_INFO, "No measured hashrate; sending default suggest_difficulty compact=0x%08x", (unsigned int)sd_compact);
+                    /* Fallback: no measured hashrate; suggest diff=1.0 */
+                    sd_value = 1.0;
+                    applog(LOG_INFO, "No measured hashrate; sending default suggest_difficulty diff=%.1f", sd_value);
                 }
 
                 char *req;
@@ -1709,7 +1825,8 @@ static void *stratum_thread(void *userdata)
                 json_object_set_new(req_json, "id", json_integer(11));
                 json_object_set_new(req_json, "method", json_string("mining.suggest_difficulty"));
                 params_arr = json_array();
-                json_array_append_new(params_arr, json_integer((json_int_t)sd_compact));
+                //json_array_append_new(params_arr, json_real(sd_value));
+                json_array_append_new(params_arr, json_integer(1));
                 json_object_set_new(req_json, "params", params_arr);
                 req = json_dumps(req_json, 0);
                 if (opt_protocol)
@@ -1718,7 +1835,7 @@ static void *stratum_thread(void *userdata)
                 if (!sent) {
                     applog(LOG_ERR, "Failed to send mining.suggest_difficulty; will retry");
                 } else {
-                    applog(LOG_INFO, "mining.suggest_difficulty sent (compact=0x%08x)", (unsigned int)sd_compact);
+                    applog(LOG_INFO, "mining.suggest_difficulty sent (diff=%.4f)", sd_value);
                     difficulty_suggested = true;
                 }
                 free(req);
@@ -1756,6 +1873,11 @@ static void *stratum_thread(void *userdata)
             (!g_work_time || !g_work.job_id || strcmp(stratum.job.job_id, g_work.job_id))) {
             pthread_mutex_lock(&g_work_lock);
             stratum_gen_work(&stratum, &g_work);
+            if (opt_debug_lax_target) {
+                /* Override target to an easy value to force submissions (for debugging) */
+                for (int wi = 0; wi < 8; wi++) g_work.target[wi] = 0xffffffffu;
+                g_work.target[7] = 0x00ffffffu;
+            }
             time(&g_work_time);
             pthread_mutex_unlock(&g_work_lock);
             if (opt_debug) {
@@ -1763,22 +1885,57 @@ static void *stratum_thread(void *userdata)
                        stratum.job.job_id ? stratum.job.job_id : "(null)",
                        stratum.job.clean, g_work.target[7]);
             }
+            /* Print full 256-bit target as big-endian hex for validation */
+            {
+                unsigned char tbytes[32];
+                char thex[65];
+                for (int wi = 0; wi < 8; wi++)
+                    be32enc((uint32_t *)(tbytes + 4 * wi), g_work.target[7 - wi]);
+                bin2hex(thex, tbytes, 32);
+                applog(LOG_INFO, "target: %s", thex);
+            }
             if (stratum.job.clean) {
                 applog(LOG_INFO, "Stratum requested work restart");
                 restart_threads();
             }
         }
 
-        if (!stratum_socket_full(&stratum, 120)) {
-            applog(LOG_ERR, "Stratum connection timed out");
-            s = NULL;
-        } else
-            s = stratum_recv_line(&stratum);
+        /* Poll for data in small increments, send ping on idle, disconnect after prolonged idle */
+        if (!stratum_socket_full(&stratum, 1)) {
+            time_t now = time(NULL);
+            if (opt_stratum_ping_secs > 0 && now - last_recv >= opt_stratum_ping_secs && now - last_ping >= opt_stratum_ping_secs) {
+                /* Send a lightweight ping (mining.get_version) */
+                json_t *req_json = json_object();
+                json_object_set_new(req_json, "id", json_integer(99));
+                json_object_set_new(req_json, "method", json_string("mining.get_version"));
+                json_object_set_new(req_json, "params", json_array());
+                char *req = json_dumps(req_json, 0);
+                if (opt_protocol)
+                    applog(LOG_INFO, "PING: %s", req);
+                stratum_send_line(&stratum, req);
+                free(req);
+                json_decref(req_json);
+                last_ping = now;
+            }
+            if (opt_stratum_idle_secs > 0 && time(NULL) - last_recv >= opt_stratum_idle_secs) {
+                applog(LOG_ERR, "Stratum idle for %d seconds, reconnecting", opt_stratum_idle_secs);
+                stratum_disconnect(&stratum);
+            }
+            continue;
+        }
+
+        s = stratum_recv_line(&stratum);
         if (!s) {
             stratum_disconnect(&stratum);
             applog(LOG_ERR, "Stratum connection interrupted");
             continue;
         }
+        if (s[0] == '\0') {
+            /* Soft timeout/no data */
+            free(s);
+            continue;
+        }
+        last_recv = time(NULL);
         if (!stratum_handle_method(&stratum, s))
             stratum_handle_response(s);
         free(s);
@@ -2083,6 +2240,22 @@ static void parse_arg(int key, char *arg, char *pname)
     case 1017:
         opt_suggest_difficulty = true;
         break;
+    case 1018:
+        v = atoi(arg);
+        if (v < 0 || v > 86400) show_usage_and_exit(1, pname);
+        opt_stratum_idle_secs = v;
+        break;
+    case 1019:
+        v = atoi(arg);
+        if (v < 0 || v > 86400) show_usage_and_exit(1, pname);
+        opt_stratum_ping_secs = v;
+        break;
+    case 1020:
+        opt_debug_sample_canonical = true;
+        break;
+    case 1021:
+        opt_debug_lax_target = true;
+        break;
     case 'S':
         use_syslog = true;
         break;
@@ -2181,11 +2354,19 @@ int main(int argc, char *argv[])
     rpc_pass = strdup("");
 
     /* parse command line */
-    parse_cmdline(argc, argv);
+	parse_cmdline(argc, argv);
+
+    /* Run a short CPUNet hashing self-check before starting work threads. */
+    if (!cpunet_selfcheck()) {
+        applog(LOG_ERR, "CPUNet hashing self-check FAILED; exiting");
+        return 1;
+    }
 
     if (opt_suggest_difficulty && !opt_benchmark) {
+        /* Run a one-time startup benchmark to estimate hashrate, but do NOT
+         * keep benchmark mode enabled during mining (it suppresses submits). */
         opt_benchmark = true;
-        applog(LOG_INFO, "Enabling benchmark mode for difficulty suggestion");
+        applog(LOG_INFO, "Enabling one-time benchmark for difficulty suggestion");
     }
 
     if (opt_benchmark && !opt_suggest_difficulty) {
@@ -2208,8 +2389,8 @@ int main(int argc, char *argv[])
 
     pthread_mutex_init(&applog_lock, NULL);
     pthread_mutex_init(&stats_lock, NULL);
-    pthread_mutex_init(&g_work_lock, NULL);
-    pthread_mutex_init(&stratum.sock_lock, NULL);
+	pthread_mutex_init(&g_work_lock, NULL);
+	pthread_mutex_init(&stratum.sock_lock, NULL);
     pthread_mutex_init(&stratum.work_lock, NULL);
 
     // Initialize benchmark synchronization barriers
@@ -2273,9 +2454,19 @@ int main(int argc, char *argv[])
     if (!thr_info)
         return 1;
 
-    thr_hashrates = (double *) calloc(opt_n_threads, sizeof(double));
-    if (!thr_hashrates)
+	thr_hashrates = (double *) calloc(opt_n_threads, sizeof(double));
+	if (!thr_hashrates)
+		return 1;
+
+    /* allocate best-hash tracking and initialize logger timestamp */
+    thr_best_header = calloc(opt_n_threads, sizeof(*thr_best_header));
+    thr_best_top_hint = calloc(opt_n_threads, sizeof(*thr_best_top_hint));
+    thr_best_digest_bytes = calloc(opt_n_threads, sizeof(*thr_best_digest_bytes));
+    thr_best_set = calloc(opt_n_threads, sizeof(*thr_best_set));
+    if (!thr_best_header || !thr_best_top_hint || !thr_best_digest_bytes || !thr_best_set)
         return 1;
+    /* initialize global best-log timestamp */
+    g_last_best_log = time(NULL);
 
     // Initialize thr_info (id and q for all threads)
     for (i = 0; i < opt_n_threads + 3; i++) {
@@ -2301,6 +2492,13 @@ int main(int argc, char *argv[])
 
     // Always run startup benchmark for 1 second
     run_startup_benchmark();
+
+    // If we only enabled benchmark due to --suggest-difficulty, disable it now
+    // so mining threads will submit shares.
+    if (opt_suggest_difficulty && opt_benchmark) {
+        opt_benchmark = false;
+        applog(LOG_INFO, "Disabling benchmark mode; proceeding with normal mining");
+    }
 
     // If only benchmarking (no URL provided), exit after benchmark
     if (opt_benchmark && !rpc_url) {

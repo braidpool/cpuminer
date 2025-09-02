@@ -31,7 +31,7 @@ static const uint32_t cpunet_preimage_len_bits = 87 * 8;
  *                  word  [14]    = 0
  *                  word  [15]    = total bit length (80+7 bytes = 696 bits)
  */
-static inline void cpunet_build_block2(uint32_t *block2, const uint32_t *pdata)
+void cpunet_build_block2(uint32_t *block2, const uint32_t *pdata)
 {
 	/* Copy header tail (words 16..19) into words 0..3 */
 	memcpy(block2, pdata + 16, 16); /* 16 bytes = 4 words */
@@ -46,7 +46,7 @@ static inline void cpunet_build_block2(uint32_t *block2, const uint32_t *pdata)
 /* Serialize the 80-byte header and CPUNet marker into the canonical 87-byte
  * preimage: header words are little-endian serialized, then "cpunet\0".
  */
-static inline void cpunet_serialize_preimage(unsigned char *out87, const uint32_t *header20)
+void cpunet_serialize_preimage(unsigned char *out87, const uint32_t *header20)
 {
     for (int i = 0; i < 20; i++)
         le32enc(out87 + 4 * i, header20[i]);
@@ -253,10 +253,10 @@ static void openssl_sha256d(unsigned char *output, const unsigned char *input, s
 
 static void cpunet_hash_simple(uint32_t *hash, const uint32_t *pdata)
 {
-	unsigned char preimage[87];
-	unsigned char openssl_hash[32];
-	unsigned char ours_bytes[32];
-	uint32_t ours_words[8];
+    unsigned char preimage[87];
+    unsigned char openssl_hash[32];
+    unsigned char ours_bytes[32];
+    uint32_t ours_words[8];
 
 	/* Build canonical 87-byte preimage */
 	cpunet_serialize_preimage(preimage, pdata);
@@ -285,6 +285,9 @@ static void cpunet_hash_simple(uint32_t *hash, const uint32_t *pdata)
 		}
 	}
 }
+
+/* Compute CPUNet digest via the optimized fast-path for a single header (nonce in pdata[19]). */
+/* cpunet_hash_fast and cpunet_selfcheck are defined later, after helpers. */
 
 void sha256d(unsigned char *hash, const unsigned char *data, int len)
 {
@@ -594,7 +597,15 @@ static inline int scanhash_sha256d_4way(int thr_id, uint32_t *pdata,
 		for (i = 0; i < 4; i++)
 			data[4 * 3 + i] = ++n;
 
-		sha256d_ms_4way(hash, data, midstate, prehash);
+        sha256d_ms_4way(hash, data, midstate, prehash);
+
+        /* Report only the best lane for diagnostics to reduce overhead. */
+        int best_lane = 0;
+        for (i = 1; i < 4; i++) {
+            if (words_leq_256(&hash[8 * i], &hash[8 * best_lane]))
+                best_lane = i;
+        }
+        miner_report_candidate(thr_id, pdata, data[4 * 3 + best_lane], swab32(hash[4 * 7 + best_lane]));
 
 		for (i = 0; i < 4; i++) {
 			if (swab32(hash[4 * 7 + i]) <= Htarg) {
@@ -671,13 +682,37 @@ static inline int scanhash_sha256d_8way(int thr_id, uint32_t *pdata,
 		for (i = 0; i < 8; i++)
 			data[8 * 3 + i] = ++n;
 
-		sha256d_ms_8way(hash, data, midstate, prehash);
+        sha256d_ms_8way(hash, data, midstate, prehash);
+
+        /* Debug: bypass precheck by canonical fulltest on all lanes when enabled */
+        if (opt_debug_lax_target || opt_debug_sample_canonical) {
+            for (i = 0; i < 8; i++) {
+                uint32_t work_header[20];
+                uint32_t tmp_digest[8];
+                memcpy(work_header, pdata, 80);
+                work_header[19] = data[8 * 3 + i];
+                cpunet_hash_simple(tmp_digest, work_header);
+                if (fulltest(tmp_digest, ptarget)) {
+                    pdata[19] = work_header[19];
+                    *hashes_done = n - first_nonce + 1;
+                    return 1;
+                }
+            }
+        }
+
+        /* Report only the best lane for diagnostics to reduce overhead. */
+        int best_lane = 0;
+        for (i = 1; i < 8; i++) {
+            if (words_leq_256(&hash[8 * i], &hash[8 * best_lane]))
+                best_lane = i;
+        }
+        miner_report_candidate(thr_id, pdata, data[8 * 3 + best_lane], swab32(hash[8 * 7 + best_lane]));
 
 		for (i = 0; i < 8; i++) {
 			if (swab32(hash[8 * 7 + i]) <= Htarg) {
-				//printf("\nDEBUG: 8-way precheck hit (lane %d)\n", i);
-				//printf("Precheck top word:   %08x (be: %08x)\n", hash[8 * 7 + i], swab32(hash[8 * 7 + i]));
-				//printf("Target Htarg:        %08x\n", Htarg);
+				printf("\nDEBUG: 8-way precheck hit (lane %d)\n", i);
+				printf("Precheck top word:   %08x (be: %08x)\n", hash[8 * 7 + i], swab32(hash[8 * 7 + i]));
+				printf("Target Htarg:        %08x\n", Htarg);
 
 				pdata[19] = data[8 * 3 + i];
 				// Rebuild full header with CPUNet nonce
@@ -685,13 +720,13 @@ static inline int scanhash_sha256d_8way(int thr_id, uint32_t *pdata,
 				memcpy(work_header, pdata, 80);     // Copy full 80-byte header
 				work_header[19] = data[8 * 3 + i];  // Update nonce for this lane
 
-				//printf("DEBUG: Now validating with cpunet_hash_simple...\n");
+				printf("DEBUG: Now validating with cpunet_hash_simple...\n");
 				cpunet_hash_simple(&hash[8 * i], work_header);
 
-				//printf("Final validation hash: ");
-				//for (int j = 0; j < 8; j++) printf("%08x", swab32(hash[8 * i + j]));
-				//printf("\n");
-				//printf("Final top word:     %08x\n", swab32(hash[8 * i + 7]));
+				printf("Final validation hash: ");
+				for (int j = 0; j < 8; j++) printf("%08x", swab32(hash[8 * i + j]));
+				printf("\n");
+				printf("Final top word:     %08x\n", swab32(hash[8 * i + 7]));
 
 				if (fulltest(&hash[8 * i], ptarget)) {
 					*hashes_done = n - first_nonce + 1;
@@ -743,7 +778,22 @@ int scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
 
 	do {
 		data[3] = ++n;
-		sha256d_ms(hash, data, midstate, prehash);
+        sha256d_ms(hash, data, midstate, prehash);
+
+        /* Debug: bypass precheck by canonical fulltest on this nonce when enabled */
+        if (opt_debug_lax_target || opt_debug_sample_canonical) {
+            uint32_t work_header[20];
+            uint32_t tmp_digest[8];
+            memcpy(work_header, pdata, 80);
+            work_header[19] = data[3];
+            cpunet_hash_simple(tmp_digest, work_header);
+            if (fulltest(tmp_digest, ptarget)) {
+                pdata[19] = work_header[19];
+                *hashes_done = n - first_nonce + 1;
+                return 1;
+            }
+        }
+        miner_report_candidate(thr_id, pdata, data[3], swab32(hash[7]));
         if (swab32(hash[7]) <= Htarg) {
             printf("\nDEBUG: Scan path found potential solution!\n");
             printf("Scan path hash[7]: %08x (swab32: %08x)\n", hash[7], swab32(hash[7]));
@@ -777,4 +827,93 @@ int scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
 	*hashes_done = n - first_nonce + 1;
 	pdata[19] = n;
 	return 0;
+}
+
+int cpunet_selfcheck(void)
+{
+    /* Build deterministic test headers and compare OpenSSL vs internal vs fast-path */
+    int failures = 0;
+    for (int t = 0; t < 3; ++t) {
+        uint32_t hdr[20];
+        for (int i = 0; i < 20; i++)
+            hdr[i] = 0x12340000u * (t + 1) ^ (0x9e3779b9u * i);
+        hdr[19] = 0x1000u * (t + 1) + 0xABCu; /* nonce */
+
+        /* Canonical 87-byte preimage */
+        unsigned char preimage[87];
+        cpunet_serialize_preimage(preimage, hdr);
+
+        /* Method 1: OpenSSL double-SHA256 */
+        unsigned char openssl_bytes[32];
+        openssl_sha256d(openssl_bytes, preimage, sizeof(preimage));
+
+        /* Method 2: Internal sha256d() */
+        unsigned char internal_bytes[32];
+        sha256d(internal_bytes, preimage, sizeof(preimage));
+
+        /* Method 3: Fast-path using existing transforms (midstate + block2, then SHA256) */
+        uint32_t state1[8], blk2[16];
+        unsigned char h1_bytes[32], h2_bytes[32];
+        sha256_init(state1);
+        /* Use swap=1 to interpret miner-layout words as little-endian and convert to big-endian */
+        sha256_transform(state1, hdr, 1);
+        cpunet_build_block2(blk2, hdr);
+        /* For swap=1, ensure length becomes 0x00000000000002B8 after swapping */
+        blk2[14] = 0;
+        blk2[15] = swab32(87 * 8);
+        sha256_transform(state1, blk2, 1);
+        for (int i = 0; i < 8; i++)
+            be32enc((uint32_t *)(h1_bytes + 4 * i), state1[i]);
+        SHA256(h1_bytes, 32, h2_bytes);
+
+        /* Compare all three byte sequences */
+        bool same_oi = (memcmp(openssl_bytes, internal_bytes, 32) == 0);
+        bool same_of = (memcmp(openssl_bytes, h2_bytes, 32) == 0);
+
+        if (!(same_oi && same_of)) {
+            char openssl_hex[65], internal_hex[65], fast_hex[65];
+            bin2hex(openssl_hex, openssl_bytes, 32);
+            bin2hex(internal_hex, internal_bytes, 32);
+            bin2hex(fast_hex, h2_bytes, 32);
+            applog(LOG_ERR, "CPUNet self-check mismatch case %d:\n  openssl =%s\n  internal=%s\n  fast    =%s", t, openssl_hex, internal_hex, fast_hex);
+            failures++;
+        }
+
+        /* Method 4: Drive scanhash_sha256d to find this very nonce via precheck target */
+        {
+            /* Recompute first SHA over 87B to get the precheck top word */
+            uint32_t pre_state[8], blk2b[16];
+            unsigned char h1b[32];
+            sha256_init(pre_state);
+            sha256_transform(pre_state, hdr, 1);
+            cpunet_build_block2(blk2b, hdr);
+            blk2b[14] = 0; blk2b[15] = swab32(87 * 8);
+            sha256_transform(pre_state, blk2b, 1);
+            for (int i = 0; i < 8; i++)
+                be32enc((uint32_t *)(h1b + 4 * i), pre_state[i]);
+            uint32_t pre_top = be32dec(h1b + 28);
+
+            /* Build a very lax full target that guarantees fulltest once precheck passes */
+            uint32_t target_words[8];
+            for (int i = 0; i < 8; i++) target_words[i] = 0xffffffffu;
+            target_words[7] = pre_top; /* ensure precheck passes for this header/nonce */
+
+            /* Drive scanhash over exactly this nonce */
+            uint32_t header_for_scan[20];
+            memcpy(header_for_scan, hdr, 80);
+            unsigned long hashes_done = 0;
+            uint32_t N = hdr[19];
+            int rc = scanhash_sha256d(0, header_for_scan, target_words, N, &hashes_done);
+            if (rc != 1 || header_for_scan[19] != N) {
+                applog(LOG_ERR, "CPUNet self-check scanhash failed case %d: rc=%d found=%08x expected=%08x", t, rc, header_for_scan[19], N);
+                failures++;
+            }
+        }
+    }
+
+    if (failures == 0) {
+        applog(LOG_INFO, "CPUNet self-check passed (3 cases)");
+        return 1;
+    }
+    return 0;
 }

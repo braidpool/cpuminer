@@ -1073,10 +1073,11 @@ char *stratum_recv_line(struct stratum_ctx *sctx)
 		time_t rstart;
 
 		time(&rstart);
-		if (!socket_full(sctx->sock, 60)) {
-			applog(LOG_ERR, "stratum_recv_line timed out");
-			goto out;
-		}
+        if (!socket_full(sctx->sock, 60)) {
+            /* Soft timeout: indicate no data without forcing disconnect */
+            sret = strdup("");
+            goto out;
+        }
 		do {
 			char s[RBUFSIZE];
 			ssize_t n;
@@ -1084,17 +1085,17 @@ char *stratum_recv_line(struct stratum_ctx *sctx)
 			memset(s, 0, RBUFSIZE);
 #if LIBCURL_VERSION_NUM >= 0x071202
 			CURLcode rc = curl_easy_recv(sctx->curl, s, RECVSIZE, (size_t *)&n);
-			if (rc == CURLE_OK && !n) {
-				ret = false;
-				break;
-			}
+            if (rc == CURLE_OK && !n) {
+                ret = false;
+                break;
+            }
 			if (rc != CURLE_OK) {
 				if (rc != CURLE_AGAIN || !socket_full(sctx->sock, 1)) {
 #else
 			n = recv(sctx->sock, s, RECVSIZE, 0);
 			if (!n) {
-				ret = false;
-				break;
+                ret = false;
+                break;
 			}
 			if (n < 0) {
 				if (!socket_blocks() || !socket_full(sctx->sock, 1)) {
@@ -1106,10 +1107,11 @@ char *stratum_recv_line(struct stratum_ctx *sctx)
 				stratum_buffer_append(sctx, s);
 		} while (time(NULL) - rstart < 60 && !strstr(sctx->sockbuf, "\n"));
 
-		if (!ret) {
-			applog(LOG_ERR, "stratum_recv_line failed");
-			goto out;
-		}
+        if (!ret) {
+            /* No more data available within inner window; not an error */
+            sret = strdup("");
+            goto out;
+        }
 	}
 
 	buflen = strlen(sctx->sockbuf);
@@ -1169,8 +1171,8 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 		sctx->url = strdup(url);
 	}
 	free(sctx->curl_url);
-	sctx->curl_url = malloc(strlen(url));
-	sprintf(sctx->curl_url, "http%s", url + 11);
+    sctx->curl_url = malloc(strlen(url) + 1);
+    sprintf(sctx->curl_url, "http%s", url + 11);
 
 	if (opt_protocol)
 		curl_easy_setopt(curl, CURLOPT_VERBOSE, 1);
@@ -1186,7 +1188,8 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 		curl_easy_setopt(curl, CURLOPT_PROXY, opt_proxy);
 		curl_easy_setopt(curl, CURLOPT_PROXYTYPE, opt_proxy_type);
 	}
-	curl_easy_setopt(curl, CURLOPT_HTTPPROXYTUNNEL, 1);
+    if (opt_proxy)
+        curl_easy_setopt(curl, CURLOPT_HTTPPROXYTUNNEL, 1);
 #if LIBCURL_VERSION_NUM >= 0x070f06
 	curl_easy_setopt(curl, CURLOPT_SOCKOPTFUNCTION, sockopt_keepalive_cb);
 #endif
@@ -1496,34 +1499,65 @@ out:
 
 static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
 {
-	uint32_t bits = 0;
-	json_t *p0 = json_array_get(params, 0);
-	if (json_is_integer(p0)) {
-		uint64_t v = (uint64_t)json_integer_value(p0);
-		bits = (uint32_t)(v & 0xffffffffu);
-	} else if (json_is_string(p0)) {
-		const char *s = json_string_value(p0);
-		if (s) {
-			char *endp = NULL;
-			if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
-				bits = (uint32_t)strtoul(s + 2, &endp, 16);
-			else
-				bits = (uint32_t)strtoul(s, &endp, 10);
-		}
-	}
-	if (!bits)
-		return false;
+    json_t *p0 = json_array_get(params, 0);
+    double diff = 0.0;
+    uint32_t bits = 0;
+    bool got_diff = false;
+    bool got_bits = false;
 
-	double diff = compact_to_diff(bits);
-	pthread_mutex_lock(&sctx->work_lock);
-	sctx->next_bits = bits;
-	sctx->next_diff = diff; /* legacy */
-	pthread_mutex_unlock(&sctx->work_lock);
+    if (json_is_real(p0)) {
+        diff = json_real_value(p0);
+        got_diff = (diff > 0.0);
+    } else if (json_is_integer(p0)) {
+        int64_t v = json_integer_value(p0);
+        if (v > 0 && v < 1000000) { /* treat small integers as difficulty */
+            diff = (double)v;
+            got_diff = true;
+        } else {
+            /* Very large integer is suspicious; many pools should not send compact bits here. Ignore to avoid over-hard target. */
+            applog(LOG_WARNING, "Ignoring suspicious set_difficulty integer=%" PRId64 " (looks like compact bits).", (long long)v);
+            /* Keep previous settings */
+            return true;
+        }
+    } else if (json_is_string(p0)) {
+        const char *s = json_string_value(p0);
+        if (s) {
+            char *endp = NULL;
+            if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+                unsigned long bv = strtoul(s + 2, &endp, 16);
+                if (bv) {
+                    bits = (uint32_t)(bv & 0xffffffffu);
+                    got_bits = true;
+                }
+            } else {
+                /* decimal difficulty as string */
+                diff = strtod(s, &endp);
+                got_diff = (diff > 0.0);
+            }
+        }
+    }
 
-	if (opt_debug)
-		applog(LOG_DEBUG, "Stratum set_difficulty bits=0x%08x (diff≈%g)", bits, diff);
+    if (!got_diff && !got_bits)
+        return false;
 
-	return true;
+    pthread_mutex_lock(&sctx->work_lock);
+    if (got_bits) {
+        sctx->next_bits = bits;
+        sctx->next_diff = compact_to_diff(bits);
+    } else {
+        sctx->next_bits = 0; /* prefer diff-based share target */
+        sctx->next_diff = diff;
+    }
+    pthread_mutex_unlock(&sctx->work_lock);
+
+    if (opt_debug) {
+        if (got_bits)
+            applog(LOG_DEBUG, "Stratum set_difficulty bits=0x%08x (diff≈%g)", bits, sctx->next_diff);
+        else
+            applog(LOG_DEBUG, "Stratum set_difficulty diff=%g", diff);
+    }
+
+    return true;
 }
 
 static bool stratum_reconnect(struct stratum_ctx *sctx, json_t *params)
