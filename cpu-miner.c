@@ -227,14 +227,13 @@ void miner_report_candidate(int thr_id, const uint32_t *pdata, uint32_t nonce, u
         return;
     /* Accept all top_hint values, including zero (very good) */
 
-    /* Compute canonical digest bytes */
     uint32_t header_copy[20];
     memcpy(header_copy, pdata, 80);
     header_copy[19] = nonce;
-    unsigned char cand_bytes[32];
-    cpunet_digest_bytes_from_header(header_copy, cand_bytes);
 
     if (opt_debug_sample_canonical) {
+        unsigned char cand_bytes[32];
+        cpunet_digest_bytes_from_header(header_copy, cand_bytes);
         if (!thr_best_set[thr_id] || memcmp(cand_bytes, thr_best_digest_bytes[thr_id], 32) < 0) {
             memcpy(thr_best_header[thr_id], header_copy, 80);
             memcpy(thr_best_digest_bytes[thr_id], cand_bytes, 32);
@@ -243,6 +242,9 @@ void miner_report_candidate(int thr_id, const uint32_t *pdata, uint32_t nonce, u
         }
     } else {
         if (!thr_best_set[thr_id] || top_hint < thr_best_top_hint[thr_id]) {
+            /* Compute and store digest bytes only when improving best top_hint */
+            unsigned char cand_bytes[32];
+            cpunet_digest_bytes_from_header(header_copy, cand_bytes);
             memcpy(thr_best_header[thr_id], header_copy, 80);
             memcpy(thr_best_digest_bytes[thr_id], cand_bytes, 32);
             thr_best_top_hint[thr_id] = top_hint;
@@ -299,13 +301,13 @@ static char const usage[] = "\nUsage: " PROGRAM_NAME " [OPTIONS]\nOptions:\n"
     "      --benchmark       run in offline benchmark mode\n"
     "  -c, --config=FILE     load a JSON-format configuration file\n"
     "  -V, --version         display version information and exit\n"
-	"      --version-mask=MASK hex mask for version rolling\n"
-	"      --suggest-difficulty  automatically suggest difficulty to pool\n"
-	"      --stratum-idle=N   idle seconds before reconnect (default: 900)\n"
-	"      --stratum-ping=N   ping interval seconds when idle (default: 60)\n"
-	"      --debug-sample-canonical  sample one canonical digest per batch for display\n"
-	"      --debug-lax-target    override share target to easy value (test submissions)\n"
-	"  -h, --help            display this help text and exit\n";
+    "      --version-mask=MASK hex mask for version rolling\n"
+    "      --suggest-difficulty  automatically suggest difficulty to pool\n"
+    "      --stratum-idle=N   idle seconds before reconnect (default: 900)\n"
+    "      --stratum-ping=N   ping interval seconds when idle (default: 60)\n"
+    "      --debug-sample-canonical  sample one canonical digest per batch for display\n"
+    "      --debug-lax-target    override share target to easy value (test submissions)\n"
+    "  -h, --help            display this help text and exit\n";
 
 static char const short_options[] =
 #ifndef WIN32
@@ -1250,16 +1252,12 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 
 static void run_startup_benchmark(void)
 {
-    applog(LOG_INFO, "Running 1-second benchmark with %d threads...", opt_n_threads);
+    applog(LOG_INFO, "Running benchmark with %d threads...", opt_n_threads);
 
     benchmark_sync.benchmark_active = true;
-    benchmark_sync.benchmark_start_time = time(NULL);
 
     // Signal all threads to start benchmark
     pthread_barrier_wait(&benchmark_sync.start_barrier);
-
-    // Give threads time to complete their 1-second benchmark
-    sleep(2);
 
     // Wait for all threads to finish benchmark
     pthread_barrier_wait(&benchmark_sync.finish_barrier);
@@ -1342,9 +1340,9 @@ static void *miner_thread(void *userdata)
         struct timeval tv_start, tv_end, diff;
         gettimeofday(&tv_start, NULL);
 
-        // Run benchmark for 1 second
-        time_t start_time = time(NULL);
-        while (time(NULL) - start_time < 1) {
+        // Run benchmark for a fixed duration
+        const double benchmark_duration_ms = 1000.0;
+        while (1) {
             uint32_t nonce_start = work.data[19];
             uint32_t max_nonce = nonce_start + 0x10000; // Small chunk
             unsigned long chunk_hashes = 0;
@@ -1362,6 +1360,14 @@ static void *miner_thread(void *userdata)
             }
             hashes_done += chunk_hashes;
             work.data[19] = max_nonce;
+
+            struct timeval tv_now, tv_start_copy;
+            gettimeofday(&tv_now, NULL);
+            tv_start_copy = tv_start;
+            timeval_subtract(&diff, &tv_now, &tv_start_copy);
+            double elapsed_ms = diff.tv_sec * 1000.0 + diff.tv_usec / 1000.0;
+            if (elapsed_ms >= benchmark_duration_ms)
+                break;
         }
 
         // Calculate hashrate for this thread
@@ -1387,6 +1393,9 @@ static void *miner_thread(void *userdata)
     if (opt_debug) {
         applog(LOG_DEBUG, "thread %d passed finish barrier", thr_id);
     }
+
+    if (opt_benchmark)
+        return NULL;
 
     // Regular mining loop
     while (1) {
@@ -2354,7 +2363,7 @@ int main(int argc, char *argv[])
     rpc_pass = strdup("");
 
     /* parse command line */
-	parse_cmdline(argc, argv);
+    parse_cmdline(argc, argv);
 
     /* Run a short CPUNet hashing self-check before starting work threads. */
     if (!cpunet_selfcheck()) {
@@ -2389,8 +2398,8 @@ int main(int argc, char *argv[])
 
     pthread_mutex_init(&applog_lock, NULL);
     pthread_mutex_init(&stats_lock, NULL);
-	pthread_mutex_init(&g_work_lock, NULL);
-	pthread_mutex_init(&stratum.sock_lock, NULL);
+    pthread_mutex_init(&g_work_lock, NULL);
+    pthread_mutex_init(&stratum.sock_lock, NULL);
     pthread_mutex_init(&stratum.work_lock, NULL);
 
     // Initialize benchmark synchronization barriers
@@ -2454,9 +2463,9 @@ int main(int argc, char *argv[])
     if (!thr_info)
         return 1;
 
-	thr_hashrates = (double *) calloc(opt_n_threads, sizeof(double));
-	if (!thr_hashrates)
-		return 1;
+    thr_hashrates = (double *) calloc(opt_n_threads, sizeof(double));
+    if (!thr_hashrates)
+        return 1;
 
     /* allocate best-hash tracking and initialize logger timestamp */
     thr_best_header = calloc(opt_n_threads, sizeof(*thr_best_header));

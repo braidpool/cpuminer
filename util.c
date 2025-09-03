@@ -1108,8 +1108,8 @@ char *stratum_recv_line(struct stratum_ctx *sctx)
 		} while (time(NULL) - rstart < 60 && !strstr(sctx->sockbuf, "\n"));
 
         if (!ret) {
-            /* No more data available within inner window; not an error */
-            sret = strdup("");
+            /* Connection closed or error */
+            sret = NULL;
             goto out;
         }
 	}

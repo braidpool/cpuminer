@@ -699,15 +699,25 @@ static inline int scanhash_sha256d_8way(int thr_id, uint32_t *pdata,
             if (lane_nonce > max_nonce)
                 continue; /* do not accept lanes beyond max_nonce */
             if (swab32(hash[8 * 7 + i]) <= Htarg) {
-                printf("\nDEBUG: 8-way precheck hit (lane %d)\n", i);
-                printf("Precheck top word:   %08x (be: %08x)\n", hash[8 * 7 + i], swab32(hash[8 * 7 + i]));
-                printf("Target Htarg:        %08x\n", Htarg);
+                if (opt_debug) {
+                    printf("\nDEBUG: 8-way precheck hit (lane %d)\n", i);
+                    printf("Precheck top word:   %08x (be: %08x)\n", hash[8 * 7 + i], swab32(hash[8 * 7 + i]));
+                    printf("Target Htarg:        %08x\n", Htarg);
+                }
 
                 pdata[19] = lane_nonce;
-                // Validate with fulltest() on canonical words
-                if (cpunet_validate_and_print(i, pdata, lane_nonce, ptarget)) {
-                    *hashes_done = n - first_nonce + 1;
-                    return 1;
+                if (opt_debug) {
+                    if (cpunet_validate_and_print(i, pdata, lane_nonce, ptarget)) {
+                        *hashes_done = n - first_nonce + 1;
+                        return 1;
+                    }
+                } else {
+                    uint32_t canon2[8];
+                    for (int j3 = 0; j3 < 8; j3++) canon2[j3] = swab32(hash[8 * i + j3]);
+                    if (fulltest(canon2, ptarget)) {
+                        *hashes_done = n - first_nonce + 1;
+                        return 1;
+                    }
                 }
             }
         }
@@ -769,29 +779,23 @@ int scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
         }
         miner_report_candidate(thr_id, pdata, n, swab32(hash[7]));
         if (swab32(hash[7]) <= Htarg) {
-            printf("\nDEBUG: Scan path found potential solution!\n");
-            printf("Scan path hash[7]: %08x (swab32: %08x)\n", hash[7], swab32(hash[7]));
-            printf("Target Htarg:      %08x\n", Htarg);
-
-            // Print the full scan path result BEFORE we overwrite it
-            printf("Scan path full hash: ");
-            for (int j = 0; j < 8; j++) printf("%08x", swab32(hash[j]));
-            printf("\n");
+            if (opt_debug) {
+                printf("\nDEBUG: Scan path found potential solution!\n");
+                printf("Scan path hash[7]: %08x (swab32: %08x)\n", hash[7], swab32(hash[7]));
+                printf("Target Htarg:      %08x\n", Htarg);
+                // Print the full scan path result BEFORE we overwrite it
+                printf("Scan path full hash: ");
+                for (int j = 0; j < 8; j++) printf("%08x", swab32(hash[j]));
+                printf("\n");
+            }
 
             pdata[19] = n;
-            // Rebuild full header with CPUNet nonce
-            uint32_t work_header[20];
-            memcpy(work_header, pdata, 80);   // Copy full 80-byte header
-            work_header[19] = n;        // Update nonce
-
-            printf("DEBUG: Validating with fast-path digest...\n");
-            printf("Final validation hash: ");
-            for (int j = 0; j < 8; j++) printf("%08x", swab32(hash[j]));
-            printf("\n");
 
             uint32_t canon[8];
             for (int j = 0; j < 8; j++) canon[j] = swab32(hash[j]);
             if (fulltest(canon, ptarget)) {
+                if (opt_debug)
+                    cpunet_validate_and_print(-1, pdata, n, ptarget);
                 *hashes_done = n - first_nonce + 1;
                 return 1;
             }
