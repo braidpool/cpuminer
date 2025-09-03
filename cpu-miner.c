@@ -836,9 +836,9 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
         uint32_t ntime, nonce;
         char ntimestr[9], noncestr[9], *xnonce2str, *req, version_hex[20] = "";
 
-        if (work->version_mask) {
+        if (opt_version_mask) {
             /* Stratum expects the full rolled version (big-endian hex), not just the mask delta */
-            sprintf(version_hex, ", \"%08x\"", swab32(work->data[0]));
+            sprintf(version_hex, ", \"%08x\"", swab32(work->data[0] & work->version_mask));
         }
         le32enc(&ntime, work->data[17]);
         le32enc(&nonce, work->data[19]);
