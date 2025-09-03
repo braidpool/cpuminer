@@ -739,11 +739,11 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
     /* assemble block header */
     work->data[0] = swab32(version);
     for (i = 0; i < 8; i++)
-        work->data[8 - i] = le32dec(prevhash + i);
+        work->data[8 - i] = swab32(be32dec(prevhash + i));
     for (i = 0; i < 8; i++)
-        work->data[9 + i] = be32dec((uint32_t *)merkle_tree[0] + i);
+        work->data[9 + i] = swab32(be32dec((uint32_t *)merkle_tree[0] + i));
     work->data[17] = swab32(curtime);
-    work->data[18] = le32dec(&bits);
+    work->data[18] = swab32(be32dec(&bits));
 
     if (unlikely(!jobj_binary(val, "target", target, sizeof(target)))) {
         applog(LOG_ERR, "JSON invalid target");
@@ -824,6 +824,20 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
     char s[345];
     int i;
     bool rc = false;
+
+    /* Debug: compute and print canonical CPUNet block hash being submitted. */
+    do {
+        uint32_t header_copy[20];
+        for (int hi = 0; hi < 20; hi++)
+            header_copy[hi] = swab32(work->data[hi]);
+        unsigned char digest[32], digest_rpc[32];
+        char hash_hex[65];
+        cpunet_digest_bytes_from_header(header_copy, digest);
+        for (int bi = 0; bi < 32; bi++) digest_rpc[bi] = digest[31 - bi];
+        bin2hex(hash_hex, digest_rpc, 32);
+        applog(LOG_INFO, "submit: block_hash=%s nonce=%08x ntime=%08x bits=%08x",
+               hash_hex, header_copy[19], header_copy[17], header_copy[18]);
+    } while (0);
 
     /* pass if the previous hash is not the current previous hash */
     if (!submit_old && memcmp(work->data + 1, g_work.data + 1, 32)) {

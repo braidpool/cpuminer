@@ -864,6 +864,79 @@ int cpunet_selfcheck(void)
         /* Skip scanhash drive check: hashing equivalence above is sufficient. */
     }
 
+    /* Validate CPUNet genesis block via both paths */
+    {
+        /* RPC fields for genesis */
+        const uint32_t ver = 1u;
+        const char *merk_hex = "7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e";
+        const uint32_t ntime = 1723652721u;      /* 0x66C7D171 */
+        const uint32_t nbits = 0x1d00ffffu;
+        const uint32_t nonce = 961348305u;       /* 0x39449A71 */
+        const char *expect_hex = "00000000bbffa57733938dbc05f86239f303636de4599905ab84bccfa909f49b";
+
+        /* Construct 80-byte header as 20 LE words in miner layout */
+        uint32_t header20[20] = {0};
+        header20[0] = ver;
+        /* header20[1..8] are zero for genesis prevhash */
+
+        /* Decode merkle (RPC big-endian hex) -> little-endian bytes for header */
+        unsigned char mr_be[32], mr_le[32];
+        if (!hex2bin(mr_be, merk_hex, 32)) {
+            applog(LOG_ERR, "CPUNet self-check: failed to parse genesis merkle root hex");
+            return 0;
+        }
+        for (int i = 0; i < 32; i++) mr_le[i] = mr_be[31 - i];
+        for (int i = 0; i < 8; i++)
+            header20[9 + i] = le32dec(mr_le + 4 * i);
+
+        header20[17] = ntime;
+        header20[18] = nbits;
+        header20[19] = nonce;
+
+        /* Path A: canonical preimage -> sha256d() */
+        unsigned char preimage[87];
+        unsigned char digest_internal[32], digest_internal_rev[32];
+        char digest_internal_hex[65];
+        cpunet_serialize_preimage(preimage, header20);
+        sha256d(digest_internal, preimage, sizeof(preimage));
+        for (int i = 0; i < 32; i++) digest_internal_rev[i] = digest_internal[31 - i];
+        bin2hex(digest_internal_hex, digest_internal_rev, 32);
+
+        /* Path B: fast midstate pipeline */
+        uint32_t pdata_equiv[20];
+        for (int i = 0; i < 20; i++)
+            pdata_equiv[i] = swab32(header20[i]); /* big-endian words for transform() */
+        uint32_t blk2[16];
+        uint32_t dataW[64];
+        uint32_t mid1[8], pre1[8];
+        uint32_t fp_hash[8];
+        unsigned char digest_fast[32], digest_fast_rev[32];
+        char digest_fast_hex[65];
+
+        cpunet_build_block2(blk2, pdata_equiv);
+        memcpy(dataW, blk2, 64);
+        sha256d_preextend(dataW);
+        sha256_init(mid1);
+        sha256_transform(mid1, pdata_equiv, 0);
+        memcpy(pre1, mid1, 32);
+        sha256d_prehash(pre1, blk2);
+        dataW[3] = swab32(header20[19]); /* nonce word in W (BE) */
+        sha256d_ms_c(fp_hash, dataW, mid1, pre1);
+        for (int i = 0; i < 8; i++)
+            be32enc((uint32_t *)(digest_fast + 4 * i), fp_hash[i]);
+        for (int i = 0; i < 32; i++) digest_fast_rev[i] = digest_fast[31 - i];
+        bin2hex(digest_fast_hex, digest_fast_rev, 32);
+
+        bool ok_internal = (strcmp(digest_internal_hex, expect_hex) == 0);
+        bool ok_fast = (strcmp(digest_fast_hex, expect_hex) == 0);
+        if (!ok_internal || !ok_fast) {
+            applog(LOG_ERR, "CPUNet genesis mismatch:\n  internal=%s\n  fast    =%s\n  expect  =%s",
+                   digest_internal_hex, digest_fast_hex, expect_hex);
+            return 0;
+        }
+        applog(LOG_INFO, "CPUNet genesis verified: %s", expect_hex);
+    }
+
     if (failures == 0) {
         applog(LOG_INFO, "CPUNet self-check passed (3 cases)");
         return 1;
