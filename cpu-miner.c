@@ -1242,6 +1242,8 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
     }
 }
 
+
+
 static void run_startup_benchmark(void)
 {
     applog(LOG_INFO, "Running benchmark with %d threads...", opt_n_threads);
@@ -1269,6 +1271,7 @@ static void run_startup_benchmark(void)
     sprintf(s, total_hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * total_hashrate);
     applog(LOG_INFO, "Benchmark complete: %s khash/s", s);
 }
+
 
 static void *miner_thread(void *userdata)
 {
@@ -1358,6 +1361,9 @@ static void *miner_thread(void *userdata)
             tv_start_copy = tv_start;
             timeval_subtract(&diff, &tv_now, &tv_start_copy);
             double elapsed_ms = diff.tv_sec * 1000.0 + diff.tv_usec / 1000.0;
+            if (opt_debug) {
+                applog(LOG_DEBUG, "thr %d: benchmark loop, %lu hashes, %.2fms elapsed", thr_id, hashes_done, elapsed_ms);
+            }
             if (elapsed_ms >= benchmark_duration_ms)
                 break;
         }
@@ -1388,6 +1394,8 @@ static void *miner_thread(void *userdata)
 
     if (opt_benchmark)
         return NULL;
+
+    
 
     // Regular mining loop
     while (1) {
@@ -1791,7 +1799,6 @@ static void *stratum_thread(void *userdata)
             pthread_mutex_lock(&g_work_lock);
             g_work_time = 0;
             pthread_mutex_unlock(&g_work_lock);
-            restart_threads();
 
             if (!stratum_connect(&stratum, stratum.url) ||
                 !stratum_subscribe(&stratum) ||
@@ -2357,6 +2364,24 @@ int main(int argc, char *argv[])
     /* parse command line */
     parse_cmdline(argc, argv);
 
+#if defined(WIN32)
+    SYSTEM_INFO sysinfo;
+    GetSystemInfo(&sysinfo);
+    num_processors = sysinfo.dwNumberOfProcessors;
+#elif defined(_SC_NPROCESSORS_CONF)
+    num_processors = sysconf(_SC_NPROCESSORS_CONF);
+#elif defined(CTL_HW) && defined(HW_NCPU)
+    int req[] = { CTL_HW, HW_NCPU };
+    size_t len = sizeof(num_processors);
+    sysctl(req, 2, &num_processors, &len, NULL, 0);
+#else
+    num_processors = 1;
+#endif
+    if (num_processors < 1)
+        num_processors = 1;
+    if (!opt_n_threads)
+        opt_n_threads = num_processors;
+
     /* Run a short CPUNet hashing self-check before starting work threads. */
     if (!cpunet_selfcheck()) {
         applog(LOG_ERR, "CPUNet hashing self-check FAILED; exiting");
@@ -2423,24 +2448,6 @@ int main(int argc, char *argv[])
         signal(SIGTERM, signal_handler);
     }
 #endif
-
-#if defined(WIN32)
-    SYSTEM_INFO sysinfo;
-    GetSystemInfo(&sysinfo);
-    num_processors = sysinfo.dwNumberOfProcessors;
-#elif defined(_SC_NPROCESSORS_CONF)
-    num_processors = sysconf(_SC_NPROCESSORS_CONF);
-#elif defined(CTL_HW) && defined(HW_NCPU)
-    int req[] = { CTL_HW, HW_NCPU };
-    size_t len = sizeof(num_processors);
-    sysctl(req, 2, &num_processors, &len, NULL, 0);
-#else
-    num_processors = 1;
-#endif
-    if (num_processors < 1)
-        num_processors = 1;
-    if (!opt_n_threads)
-        opt_n_threads = num_processors;
 
 #ifdef HAVE_SYSLOG_H
     if (use_syslog)
