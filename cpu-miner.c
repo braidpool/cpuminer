@@ -744,9 +744,6 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
         work->data[9 + i] = be32dec((uint32_t *)merkle_tree[0] + i);
     work->data[17] = swab32(curtime);
     work->data[18] = le32dec(&bits);
-    memset(work->data + 19, 0x00, 52);
-    work->data[20] = 0x80000000;
-    work->data[31] = 0x00000280;
 
     if (unlikely(!jobj_binary(val, "target", target, sizeof(target)))) {
         applog(LOG_ERR, "JSON invalid target");
@@ -1130,9 +1127,6 @@ static bool get_work(struct thr_info *thr, struct work *work)
     if (opt_benchmark) {
         memset(work->data, 0x55, 76);
         work->data[17] = swab32(time(NULL));
-        memset(work->data + 19, 0x00, 52);
-        work->data[20] = 0x80000000;
-        work->data[31] = 0x00000280;
         memset(work->target, 0x00, sizeof(work->target));
         return true;
     }
@@ -1216,15 +1210,13 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 
     /* Assemble block header */
     memset(work->data, 0, 128);
-    work->data[0] = le32dec(sctx->job.version);
+    work->data[0] = swab32(le32dec(sctx->job.version));
     for (i = 0; i < 8; i++)
-        work->data[1 + i] = le32dec((uint32_t *)sctx->job.prevhash + i);
+        work->data[1 + i] = swab32(le32dec((uint32_t *)sctx->job.prevhash + i));
     for (i = 0; i < 8; i++)
-        work->data[9 + i] = be32dec((uint32_t *)merkle_root + i);
-    work->data[17] = le32dec(sctx->job.ntime);
-    work->data[18] = le32dec(sctx->job.nbits);
-    work->data[20] = 0x80000000;
-    work->data[31] = 0x00000280;
+        work->data[9 + i] = swab32(be32dec((uint32_t *)merkle_root + i));
+    work->data[17] = swab32(le32dec(sctx->job.ntime));
+    work->data[18] = swab32(le32dec(sctx->job.nbits));
 
     work->version_mask = sctx->job.version_mask;
     pthread_mutex_unlock(&sctx->work_lock);
