@@ -1254,7 +1254,7 @@ static const char *get_stratum_session_id(json_t *val)
 
 bool stratum_subscribe(struct stratum_ctx *sctx)
 {
-	char *s, *sret = NULL;
+    char *s, *sret = NULL;
 	const char *sid, *xnonce1;
 	int xn2_size;
 	json_t *val = NULL, *res_val, *err_val;
@@ -1275,17 +1275,23 @@ start:
 		goto out;
 	}
 
-	if (!socket_full(sctx->sock, 30)) {
-		applog(LOG_ERR, "stratum_subscribe timed out");
-		goto out;
-	}
+    /* Read lines until we get the subscribe response (skip methods/keepalives) */
+    while (1) {
+        if (!socket_full(sctx->sock, 30)) {
+            applog(LOG_ERR, "stratum_subscribe timed out");
+            goto out;
+        }
+        sret = stratum_recv_line(sctx);
+        if (!sret)
+            goto out;
+        if (sret[0] == '\0') { free(sret); continue; }
+        if (!stratum_handle_method(sctx, sret))
+            break;
+        free(sret);
+    }
 
-	sret = stratum_recv_line(sctx);
-	if (!sret)
-		goto out;
-
-	val = JSON_LOADS(sret, &err);
-	free(sret);
+    val = JSON_LOADS(sret, &err);
+    free(sret);
 	if (!val) {
 		applog(LOG_ERR, "JSON decode failed(%d): %s", err.line, err.text);
 		goto out;
@@ -1370,14 +1376,15 @@ bool stratum_authorize(struct stratum_ctx *sctx, const char *user, const char *p
 	if (!stratum_send_line(sctx, s))
 		goto out;
 
-	while (1) {
-		sret = stratum_recv_line(sctx);
-		if (!sret)
-			goto out;
-		if (!stratum_handle_method(sctx, sret))
-			break;
-		free(sret);
-	}
+    while (1) {
+        sret = stratum_recv_line(sctx);
+        if (!sret)
+            goto out;
+        if (sret[0] == '\0') { free(sret); continue; }
+        if (!stratum_handle_method(sctx, sret))
+            break;
+        free(sret);
+    }
 
 	val = JSON_LOADS(sret, &err);
 	free(sret);

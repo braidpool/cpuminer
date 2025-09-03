@@ -1591,14 +1591,14 @@ static void *miner_thread(void *userdata)
                 g_last_best_log = now_ts;
             }
         }
-        if (opt_benchmark && thr_id == opt_n_threads - 1) {
+        if (thr_id == opt_n_threads - 1) {
             double hashrate = 0.;
             for (i = 0; i < opt_n_threads && thr_hashrates[i]; i++)
                 hashrate += thr_hashrates[i];
-            //if (i == opt_n_threads) {
-            //    sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * hashrate);
-            //    applog(LOG_INFO, "Total: %s khash/s", s);
-            //}
+            if (i == opt_n_threads) {
+                sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * hashrate);
+                applog(LOG_INFO, "Total: %s khash/s", s);
+            }
         }
 
         /* if nonce found, submit work */
