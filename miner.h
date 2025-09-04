@@ -157,6 +157,11 @@ extern int scanhash_sha256d(int thr_id, uint32_t *pdata,
 /* CPUNet self-check: verify fast-path hashing matches canonical 87-byte hashing. */
 int cpunet_selfcheck(void);
 
+/* Optional detailed benchmarks across implementations (invoked with --benchmark). */
+void sha256_print_impls(void);
+void benchmark_sha256d_all_impls(void);
+void sha256_auto_select_backend(void);
+
 extern unsigned char *scrypt_buffer_alloc(int N);
 extern int scanhash_scrypt(int thr_id, uint32_t *pdata,
 	unsigned char *scratchbuf, const uint32_t *ptarget,

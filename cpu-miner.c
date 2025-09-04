@@ -483,6 +483,7 @@ static char const usage[] = "\nUsage: " PROGRAM_NAME " [OPTIONS]\nOptions:\n"
     "  -V, --version         display version information and exit\n"
     "      --version-mask=MASK hex mask for version rolling\n"
     "      --suggest-difficulty  automatically suggest difficulty to pool\n"
+    "      --backend=NAME     force SHA256 backend: auto|scalar|4way|8way|16way\n"
     "      --stratum-idle=N   idle seconds before reconnect (default: 900)\n"
     "      --stratum-ping=N   ping interval seconds when idle (default: 60)\n"
     "      --debug-sample-canonical  sample one canonical digest per batch for display\n"
@@ -539,6 +540,7 @@ static struct option const options[] = {
     { "debug-sample-canonical", 0, NULL, 1020 },
     { "debug-lax-target", 0, NULL, 1021 },
     { "debug-merkle-both", 0, NULL, 1022 },
+    { "backend", 1, NULL, 1023 },
     { 0, 0, 0, 0 }
 };
 
@@ -1509,30 +1511,54 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 
 
 
+/* Global benchmark accounting to avoid inflated sums under oversubscription */
+static volatile unsigned long long g_bench_hashes_total = 0ULL;
+
 static void run_startup_benchmark(void)
 {
     applog(LOG_INFO, "Running benchmark with %d threads...", opt_n_threads);
+
+    // Reset global counter
+    __sync_lock_test_and_set(&g_bench_hashes_total, 0ULL);
+
+    const double benchmark_duration_ms = 1000.0; // 1 second wall clock
+    struct timeval t0, t1, dt;
+    gettimeofday(&t0, NULL);
 
     benchmark_sync.benchmark_active = true;
 
     // Signal all threads to start benchmark
     pthread_barrier_wait(&benchmark_sync.start_barrier);
 
-    // Wait for all threads to finish benchmark
-    pthread_barrier_wait(&benchmark_sync.finish_barrier);
-
-    benchmark_sync.benchmark_active = false;
-
-    // Calculate total hashrate
-    double total_hashrate = 0.0;
-    for (int i = 0; i < opt_n_threads; i++) {
-        total_hashrate += thr_hashrates[i];
+    // Sleep until target duration has passed
+    while (1) {
+        usleep(1000); // 1ms poll
+        gettimeofday(&t1, NULL);
+        struct timeval ts = t0;
+        timeval_subtract(&dt, &t1, &ts);
+        double elapsed_ms = dt.tv_sec * 1000.0 + dt.tv_usec / 1000.0;
+        if (elapsed_ms >= benchmark_duration_ms)
+            break;
     }
 
-    // Store for difficulty suggestion
-    suggested_difficulty = total_hashrate / 1000.0; // Convert to KHash/s
+    // Stop threads and wait for them to finish their current chunk
+    benchmark_sync.benchmark_active = false;
+    pthread_barrier_wait(&benchmark_sync.finish_barrier);
 
-    char s[345];
+    // Measure final elapsed time precisely
+    gettimeofday(&t1, NULL);
+    timeval_subtract(&dt, &t1, &t0);
+    double elapsed_sec = dt.tv_sec + 1e-6 * dt.tv_usec;
+    if (elapsed_sec <= 0)
+        elapsed_sec = 1.0; // safety
+
+    // Compute total hashrate using global counter
+    double total_hashrate = (double) g_bench_hashes_total / elapsed_sec;
+
+    // Store for difficulty suggestion (KHash/s)
+    suggested_difficulty = total_hashrate / 1000.0;
+
+    char s[64];
     sprintf(s, total_hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * total_hashrate);
     applog(LOG_INFO, "Benchmark complete: %s khash/s", s);
 }
@@ -1579,13 +1605,15 @@ static void *miner_thread(void *userdata)
         }
     }
 
-    // Benchmark phase - all threads participate
-    pthread_barrier_wait(&benchmark_sync.start_barrier);
-
-    if (benchmark_sync.benchmark_active) {
-        if (opt_debug) {
+    // Benchmark phase - all threads participate (global timer + counter)
+    if (opt_benchmark) {
+        // Wait until main arms the benchmark, then synchronize
+        while (!benchmark_sync.benchmark_active)
+            sched_yield();
+        pthread_barrier_wait(&benchmark_sync.start_barrier);
+        if (opt_debug)
             applog(LOG_DEBUG, "thread %d starting benchmark", thr_id);
-        }
+
         // Setup benchmark work
         memset(work.data, 0x55, 76);
         work.data[17] = swab32(time(NULL));
@@ -1596,69 +1624,38 @@ static void *miner_thread(void *userdata)
         work.target[7] = 0x0000ffff; // Reasonable benchmark target
         work.data[19] = 0xffffffffU / opt_n_threads * thr_id;
 
-        unsigned long hashes_done = 0;
-        struct timeval tv_start, tv_end, diff;
-        gettimeofday(&tv_start, NULL);
-
-        // Run benchmark for a fixed duration
-        const double benchmark_duration_ms = 1000.0;
-        while (1) {
+        // Loop while benchmark is active, add to global counter
+        while (benchmark_sync.benchmark_active) {
             uint32_t nonce_start = work.data[19];
-            uint32_t max_nonce = nonce_start + 0x10000; // Small chunk
+            uint32_t max_nonce = nonce_start + 0x20000; // moderate chunk
             unsigned long chunk_hashes = 0;
 
-            int rc = 0;
             switch (opt_algo) {
             case ALGO_SCRYPT:
-                rc = scanhash_scrypt(thr_id, work.data, scratchbuf, work.target,
-                                    max_nonce, &chunk_hashes, opt_scrypt_n);
+                scanhash_scrypt(thr_id, work.data, scratchbuf, work.target,
+                                max_nonce, &chunk_hashes, opt_scrypt_n);
                 break;
             case ALGO_SHA256D:
-                rc = scanhash_sha256d(thr_id, work.data, work.target,
-                                    max_nonce, &chunk_hashes);
+                scanhash_sha256d(thr_id, work.data, work.target,
+                                 max_nonce, &chunk_hashes);
                 break;
             }
-            hashes_done += chunk_hashes;
+
+            // Advance nonce and accumulate globally
             work.data[19] = max_nonce;
-
-            struct timeval tv_now, tv_start_copy;
-            gettimeofday(&tv_now, NULL);
-            tv_start_copy = tv_start;
-            timeval_subtract(&diff, &tv_now, &tv_start_copy);
-            double elapsed_ms = diff.tv_sec * 1000.0 + diff.tv_usec / 1000.0;
-            if (opt_debug) {
-                applog(LOG_DEBUG, "thr %d: benchmark loop, %lu hashes, %.2fms elapsed", thr_id, hashes_done, elapsed_ms);
-            }
-            if (elapsed_ms >= benchmark_duration_ms)
-                break;
+            if (chunk_hashes)
+                __sync_fetch_and_add(&g_bench_hashes_total, (unsigned long long)chunk_hashes);
         }
+        if (opt_debug)
+            applog(LOG_DEBUG, "thread %d waiting at finish barrier", thr_id);
+        pthread_barrier_wait(&benchmark_sync.finish_barrier);
+        if (opt_debug)
+            applog(LOG_DEBUG, "thread %d passed finish barrier", thr_id);
 
-        // Calculate hashrate for this thread
-        gettimeofday(&tv_end, NULL);
-        timeval_subtract(&diff, &tv_end, &tv_start);
-        if (diff.tv_usec || diff.tv_sec) {
-            thr_hashrates[thr_id] = hashes_done / (diff.tv_sec + 1e-6 * diff.tv_usec);
-        }
-
-        if (opt_debug) {
-            sprintf(s, thr_hashrates[thr_id] >= 1e6 ? "%.0f" : "%.2f", 1e-3 * thr_hashrates[thr_id]);
-            applog(LOG_DEBUG, "thread %d benchmark: %s khash/s (%lu hashes)", thr_id, s, hashes_done);
-        }
-    } else if (opt_debug) {
-        applog(LOG_DEBUG, "thread %d skipped benchmark (not active)", thr_id);
+        // In pure benchmark mode, threads exit after the run.
+        if (!opt_suggest_difficulty)
+            return NULL;
     }
-
-    if (opt_debug) {
-        applog(LOG_DEBUG, "thread %d waiting at finish barrier", thr_id);
-    }
-    pthread_barrier_wait(&benchmark_sync.finish_barrier);
-
-    if (opt_debug) {
-        applog(LOG_DEBUG, "thread %d passed finish barrier", thr_id);
-    }
-
-    if (opt_benchmark)
-        return NULL;
 
     
 
@@ -1859,21 +1856,19 @@ static void *miner_thread(void *userdata)
                 } else {
                     strcpy(best_hex_or_none, "(none)");
                 }
-                /* Print on separate lines for alignment */
+                /* Aggregate and print hashrate over all threads */
+                double total_hashrate = 0.0;
+                for (int ti = 0; ti < opt_n_threads; ++ti)
+                    total_hashrate += thr_hashrates[ti];
+                char rate_s[64];
+                sprintf(rate_s, total_hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * total_hashrate);
+
                 //applog(LOG_INFO, "target: %s", target_hex);
-                applog(LOG_INFO, "best  : %s", best_hex_or_none);
+                applog(LOG_INFO, "hashrate: %s khash/s   best: %s", rate_s, best_hex_or_none);
                 g_last_best_log = now_ts;
             }
         }
-        if (thr_id == opt_n_threads - 1) {
-            double hashrate = 0.;
-            for (i = 0; i < opt_n_threads && thr_hashrates[i]; i++)
-                hashrate += thr_hashrates[i];
-            if (i == opt_n_threads) {
-                sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * hashrate);
-                applog(LOG_INFO, "Total: %s khash/s", s);
-            }
-        }
+        /* per-5s hashrate printed above by thread 0 */
 
         /* if nonce found, submit work */
         if (rc && !opt_benchmark && !submit_work(mythr, &work))
@@ -2290,6 +2285,7 @@ static void parse_config(json_t *config, char *pname, char *ref);
 
 static void parse_arg(int key, char *arg, char *pname)
 {
+    extern volatile int g_backend_force;
     char *p;
     int v, i;
 
@@ -2532,6 +2528,18 @@ static void parse_arg(int key, char *arg, char *pname)
     case 1022:
         opt_debug_merkle_both = true;
         break;
+    case 1023:        /* --backend */
+        if (!arg) break;
+        if (!strcasecmp(arg, "auto")) g_backend_force = 0;
+        else if (!strcasecmp(arg, "scalar")) g_backend_force = 1;
+        else if (!strcasecmp(arg, "4way") || !strcasecmp(arg, "4-way")) g_backend_force = 2;
+        else if (!strcasecmp(arg, "8way") || !strcasecmp(arg, "8-way")) g_backend_force = 3;
+        else if (!strcasecmp(arg, "16way") || !strcasecmp(arg, "16-way")) g_backend_force = 4;
+        else {
+            fprintf(stderr, "%s: invalid backend '%s' (use auto|scalar|4way|8way|16way)\n", pname, arg);
+            show_usage_and_exit(1, pname);
+        }
+        break;
     case 'S':
         use_syslog = true;
         break;
@@ -2656,6 +2664,9 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* Print which SHA256 backends are available on this CPU */
+    sha256_print_impls();
+
     if (opt_suggest_difficulty && !opt_benchmark) {
         /* Run a one-time startup benchmark to estimate hashrate, but do NOT
          * keep benchmark mode enabled during mining (it suppresses submits). */
@@ -2733,6 +2744,16 @@ int main(int argc, char *argv[])
     thr_hashrates = (double *) calloc(opt_n_threads, sizeof(double));
     if (!thr_hashrates)
         return 1;
+
+    /* Auto-select the fastest backend once accounting is allocated (only if not forced) */
+    extern volatile int g_backend_force;
+    if (g_backend_force == 0)
+        sha256_auto_select_backend();
+
+    /* Run detailed micro-benchmark across implementations when requested */
+    if (opt_benchmark && !opt_suggest_difficulty) {
+        benchmark_sha256d_all_impls();
+    }
 
     /* allocate best-hash tracking and initialize logger timestamp */
     thr_best_header = calloc(opt_n_threads, sizeof(*thr_best_header));

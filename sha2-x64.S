@@ -494,10 +494,10 @@ _sha256_transform:
 
 	.text
 	.p2align 6
-	.globl sha256d_ms
-	.globl _sha256d_ms
-sha256d_ms:
-_sha256d_ms:
+	.globl sha256d_ms_phe
+	.globl _sha256d_ms_phe
+sha256d_ms_phe:
+_sha256d_ms_phe:
 #if defined(_WIN64) || defined(__CYGWIN__)
 	pushq	%rdi
 	pushq	%rsi

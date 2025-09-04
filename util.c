@@ -493,9 +493,10 @@ void memrev(unsigned char *p, size_t len)
 
 void bin2hex(char *s, const unsigned char *p, size_t len)
 {
-	int i;
-	for (i = 0; i < len; i++)
+	for (size_t i = 0; i < len; i++)
 		sprintf(s + (i * 2), "%02x", (unsigned int) p[i]);
+	/* Ensure NUL termination for callers that preallocate len*2+1 buffers */
+	s[len * 2] = '\0';
 }
 
 char *abin2hex(const unsigned char *p, size_t len)
