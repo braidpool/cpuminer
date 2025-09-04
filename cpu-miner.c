@@ -923,11 +923,11 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
     /* assemble block header */
     work->data[0] = swab32(version);
     for (i = 0; i < 8; i++)
-        work->data[8 - i] = swab32(be32dec(prevhash + i));
+        work->data[8 - i] = le32dec(prevhash + i);
     for (i = 0; i < 8; i++)
-        work->data[9 + i] = swab32(be32dec((uint32_t *)merkle_tree[0] + i));
+        work->data[9 + i] = be32dec((uint32_t *)merkle_tree[0] + i);
     work->data[17] = swab32(curtime);
-    work->data[18] = swab32(be32dec(&bits));
+    work->data[18] = le32dec(&bits);
 
     if (unlikely(!jobj_binary(val, "target", target, sizeof(target)))) {
         applog(LOG_ERR, "JSON invalid target");
@@ -1475,11 +1475,10 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
     memset(work->data, 0, 128);
     /* version/ntime/nbits come from Stratum as big-endian hex; decode as BE */
     work->data[0] = swab32(be32dec(sctx->job.version));
-    /* Stratum prevhash param is 32-byte BE hex. Header stores prevhash in LE bytes,
-       i.e., reverse the full 32 bytes. Achieve this by reversing 32-bit word order
-       and endian-swapping each word during serialization via le32enc later. */
+    /* Server sends prevhash as 32-byte little-endian hex. The block header stores
+       prevhash bytes in little-endian, so load as LE words without reversing. */
     for (i = 0; i < 8; i++)
-        work->data[1 + i] = swab32(be32dec((uint32_t *)sctx->job.prevhash + (7 - i)));
+        work->data[1 + i] = le32dec(sctx->job.prevhash + 4 * i);
     for (i = 0; i < 8; i++)
         work->data[9 + i] = swab32(be32dec((uint32_t *)merkle_root + i));
     work->data[17] = swab32(be32dec(sctx->job.ntime));
@@ -1657,7 +1656,7 @@ static void *miner_thread(void *userdata)
             return NULL;
     }
 
-    
+
 
     // Regular mining loop
     while (1) {
