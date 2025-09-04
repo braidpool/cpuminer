@@ -221,6 +221,106 @@ static inline void cpunet_digest_bytes_from_header(const uint32_t *header20, uns
     sha256d(out_bytes, preimage, sizeof(preimage));
 }
 
+/* Debug aid: enumerate block-hash variants under different endianness interpretations.
+ * For each combination over:
+ *  - Version: LE/BE
+ *  - Prevhash: word-order Normal/Reversed x per-word bytes LE/BE
+ *  - Merkle:   word-order Normal/Reversed x per-word bytes LE/BE
+ *  - NTime: LE/BE
+ *  - NBits: LE/BE
+ *  - Nonce: LE/BE
+ * Compute sha256d over the 80-byte header + "cpunet\0" and print hash in RPC hex. */
+static void debug_dump_all_endian_hashes(const uint32_t *hdr20)
+{
+    unsigned char pre[87];
+    const char *ord_name[2] = {"N", "R"};
+    const char *end_name[2] = {"LE", "BE"};
+
+    /* Print header fields in big-endian hex (RPC-style) */
+    {
+        unsigned char ver_be[4], ntime_be[4], nbits_be[4], nonce_be[4];
+        unsigned char prev_be[32], merk_be[32];
+        char ver_hex[9], ntime_hex[9], nbits_hex[9], nonce_hex[9];
+        char prev_hex[65], merk_hex[65];
+
+        /* 32-bit fields */
+        be32enc(ver_be,   hdr20[0]);
+        be32enc(ntime_be, hdr20[17]);
+        be32enc(nbits_be, hdr20[18]);
+        be32enc(nonce_be, hdr20[19]);
+
+        /* 32-byte fields (RPC big-endian: reverse full 32 bytes) */
+        for (int i = 0; i < 8; i++)
+            be32enc(prev_be + 4 * i, hdr20[1 + (7 - i)]);
+        for (int i = 0; i < 8; i++)
+            be32enc(merk_be + 4 * i, hdr20[9 + (7 - i)]);
+
+        bin2hex(ver_hex,   ver_be,   4);
+        bin2hex(ntime_hex, ntime_be, 4);
+        bin2hex(nbits_hex, nbits_be, 4);
+        bin2hex(nonce_hex, nonce_be, 4);
+        bin2hex(prev_hex,  prev_be,  32);
+        bin2hex(merk_hex,  merk_be,  32);
+
+        applog(LOG_INFO, "Header fields (BE hex):");
+        applog(LOG_INFO, "  version=%s", ver_hex);
+        applog(LOG_INFO, "  prevhash=%s", prev_hex);
+        applog(LOG_INFO, "  merkle  =%s", merk_hex);
+        applog(LOG_INFO, "  ntime=%s nbits=%s nonce=%s", ntime_hex, nbits_hex, nonce_hex);
+    }
+
+    for (int mask = 0; mask < 256; mask++) {
+        int v_be    = (mask >> 0) & 1;
+        int p_rev   = (mask >> 1) & 1;
+        int p_be    = (mask >> 2) & 1;
+        int m_rev   = (mask >> 3) & 1;
+        int m_be    = (mask >> 4) & 1;
+        int t_be    = (mask >> 5) & 1;
+        int b_be    = (mask >> 6) & 1;
+        int n_be    = (mask >> 7) & 1;
+
+        unsigned char *w = pre;
+        /* version */
+        if (v_be) be32enc(w, hdr20[0]); else le32enc(w, hdr20[0]);
+        w += 4;
+        /* prevhash: words 1..8 */
+        for (int i = 0; i < 8; i++) {
+            int idx = p_rev ? (8 - 1 - i) : i;
+            if (p_be) be32enc(w, hdr20[1 + idx]); else le32enc(w, hdr20[1 + idx]);
+            w += 4;
+        }
+        /* merkle: words 9..16 */
+        for (int i = 0; i < 8; i++) {
+            int idx = m_rev ? (8 - 1 - i) : i;
+            if (m_be) be32enc(w, hdr20[9 + idx]); else le32enc(w, hdr20[9 + idx]);
+            w += 4;
+        }
+        /* ntime, nbits, nonce */
+        if (t_be) be32enc(w, hdr20[17]); else le32enc(w, hdr20[17]);
+        w += 4;
+        if (b_be) be32enc(w, hdr20[18]); else le32enc(w, hdr20[18]);
+        w += 4;
+        if (n_be) be32enc(w, hdr20[19]); else le32enc(w, hdr20[19]);
+        w += 4;
+
+        /* Append CPUNet marker */
+        memcpy(pre + 80, "cpunet", 6);
+        pre[86] = 0x00;
+
+        unsigned char dig[32], dig_rpc[32];
+        char hex[65];
+        sha256d(dig, pre, sizeof(pre));
+        for (int i = 0; i < 32; i++) dig_rpc[i] = dig[31 - i];
+        bin2hex(hex, dig_rpc, 32);
+        applog(LOG_INFO, "%s  [V=%s P=%s+%s M=%s+%s T=%s B=%s N=%s]",
+               hex,
+               end_name[v_be],
+               ord_name[p_rev], end_name[p_be],
+               ord_name[m_rev], end_name[m_be],
+               end_name[t_be], end_name[b_be], end_name[n_be]);
+    }
+}
+
 void miner_report_candidate(int thr_id, const uint32_t *pdata, uint32_t nonce, uint32_t top_hint)
 {
     if (!thr_best_header || thr_id < 0)
@@ -829,7 +929,7 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
     do {
         uint32_t header_copy[20];
         for (int hi = 0; hi < 20; hi++)
-            header_copy[hi] = swab32(work->data[hi]);
+            header_copy[hi] = work->data[hi]; /* use LE words as-is */
         unsigned char digest[32], digest_rpc[32];
         char hash_hex[65];
         cpunet_digest_bytes_from_header(header_copy, digest);
@@ -837,6 +937,11 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
         bin2hex(hash_hex, digest_rpc, 32);
         applog(LOG_INFO, "submit: block_hash=%s nonce=%08x ntime=%08x bits=%08x",
                hash_hex, header_copy[19], header_copy[17], header_copy[18]);
+        /* If debugging, enumerate alternative endianness interpretations. */
+        if (opt_debug || opt_debug_lax_target) {
+            applog(LOG_INFO, "Enumerating endianness variants (hash in RPC order):");
+            debug_dump_all_endian_hashes(header_copy);
+        }
     } while (0);
 
     /* pass if the previous hash is not the current previous hash */
@@ -870,6 +975,12 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
         if (unlikely(!rc)) {
             applog(LOG_ERR, "submit_upstream_work stratum_send_line failed");
             goto out;
+        }
+
+        /* In lax-target debug mode, send exactly one mining.submit then exit. */
+        if (opt_debug_lax_target) {
+            applog(LOG_INFO, "--debug-lax-target: sent one mining.submit; exiting");
+            exit(0);
         }
     } else if (work->txs) {
         char *req;
