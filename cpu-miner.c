@@ -142,6 +142,7 @@ static bool difficulty_suggested = false;
 static double suggested_difficulty = 0.0;
 bool opt_debug_sample_canonical = false;
 bool opt_debug_lax_target = false;
+bool opt_debug_merkle_both = false;
 
 static int pk_script_size;
 static unsigned char pk_script[42];
@@ -221,6 +222,82 @@ static inline void cpunet_digest_bytes_from_header(const uint32_t *header20, uns
     sha256d(out_bytes, preimage, sizeof(preimage));
 }
 
+/* Decode Bitcoin varint from [*pp, end). Advances *pp on success. */
+static bool read_varint_ptr(const unsigned char **pp, const unsigned char *end, uint64_t *val)
+{
+    const unsigned char *p = *pp;
+    if (p >= end) return false;
+    unsigned char fb = *p++;
+    if (fb < 0xfd) {
+        *val = fb;
+        *pp = p; return true;
+    }
+    if (fb == 0xfd) {
+        if (p + 2 > end) return false;
+        *val = (uint64_t)p[0] | ((uint64_t)p[1] << 8);
+        p += 2; *pp = p; return true;
+    }
+    if (fb == 0xfe) {
+        if (p + 4 > end) return false;
+        *val = le32dec(p);
+        p += 4; *pp = p; return true;
+    }
+    /* fb == 0xff */
+    if (p + 8 > end) return false;
+    uint64_t lo = le32dec(p);
+    uint64_t hi = le32dec(p + 4);
+    *val = lo | (hi << 32);
+    p += 8; *pp = p; return true;
+}
+
+/* Compute txid = sha256d(legacy-serialization) from possibly-segwit raw tx bytes. */
+static bool compute_txid_nonwitness(const unsigned char *tx, size_t len, unsigned char out[32])
+{
+    const unsigned char *p = tx;
+    const unsigned char *end = tx + len;
+    if (len < 10) return false;
+    const unsigned char *ver = p; p += 4;
+    if (p > end) return false;
+    bool segwit = false;
+    if (p + 2 <= end && p[0] == 0x00 && p[1] == 0x01) {
+        segwit = true;
+        p += 2; /* skip marker+flag */
+    }
+    const unsigned char *vin_start = p;
+    uint64_t vin_cnt = 0;
+    if (!read_varint_ptr(&p, end, &vin_cnt)) return false;
+    for (uint64_t ii = 0; ii < vin_cnt; ++ii) {
+        if (p + 32 + 4 > end) return false;
+        p += 32 + 4; /* prevout */
+        uint64_t slen = 0;
+        if (!read_varint_ptr(&p, end, &slen)) return false;
+        if (p + slen + 4 > end) return false; /* script + sequence */
+        p += slen + 4;
+    }
+    uint64_t vout_cnt = 0;
+    if (!read_varint_ptr(&p, end, &vout_cnt)) return false;
+    for (uint64_t oo = 0; oo < vout_cnt; ++oo) {
+        if (p + 8 > end) return false; /* value */
+        p += 8;
+        uint64_t pklen = 0;
+        if (!read_varint_ptr(&p, end, &pklen)) return false;
+        if (p + pklen > end) return false;
+        p += pklen;
+    }
+    const unsigned char *vout_end = p;
+    if (end < tx + 4) return false;
+    const unsigned char *locktime_le = end - 4;
+    /* Build legacy bytes: version + vin..vout + locktime */
+    size_t body_len = (size_t)(vout_end - vin_start);
+    size_t out_len = 4 + body_len + 4;
+    unsigned char *buf = (unsigned char *)alloca(out_len);
+    memcpy(buf, ver, 4);
+    memcpy(buf + 4, vin_start, body_len);
+    memcpy(buf + 4 + body_len, locktime_le, 4);
+    sha256d(out, buf, out_len);
+    return true;
+}
+
 /* Debug aid: enumerate block-hash variants under different endianness interpretations.
  * For each combination over:
  *  - Version: LE/BE
@@ -236,24 +313,27 @@ static void debug_dump_all_endian_hashes(const uint32_t *hdr20)
     const char *ord_name[2] = {"N", "R"};
     const char *end_name[2] = {"LE", "BE"};
 
-    /* Print header fields in big-endian hex (RPC-style) */
+    /* Print header fields in big-endian hex (RPC-style)
+       Reconstruct by serializing header fields to little-endian bytes first,
+       then reversing the full 32 bytes for 256-bit hashes. */
     {
         unsigned char ver_be[4], ntime_be[4], nbits_be[4], nonce_be[4];
         unsigned char prev_be[32], merk_be[32];
         char ver_hex[9], ntime_hex[9], nbits_hex[9], nonce_hex[9];
         char prev_hex[65], merk_hex[65];
-
-        /* 32-bit fields */
-        be32enc(ver_be,   hdr20[0]);
-        be32enc(ntime_be, hdr20[17]);
-        be32enc(nbits_be, hdr20[18]);
-        be32enc(nonce_be, hdr20[19]);
-
-        /* 32-byte fields (RPC big-endian: reverse full 32 bytes) */
-        for (int i = 0; i < 8; i++)
-            be32enc(prev_be + 4 * i, hdr20[1 + (7 - i)]);
-        for (int i = 0; i < 8; i++)
-            be32enc(merk_be + 4 * i, hdr20[9 + (7 - i)]);
+        /* Build header bytes and print BE per field (reverse each slice) */
+        unsigned char header80[80];
+        for (int wi = 0; wi < 20; wi++)
+            le32enc(header80 + 4 * wi, hdr20[wi]);
+        for (int bi = 0; bi < 4; bi++) ver_be[bi]   = header80[3 - bi];
+        if (have_stratum && stratum.job.prevhash)
+            for (int bi = 0; bi < 32; bi++) prev_be[bi] = stratum.job.prevhash[bi];
+        else
+            for (int bi = 0; bi < 32; bi++) prev_be[bi] = header80[4 + 31 - bi];
+        for (int bi = 0; bi < 32; bi++) merk_be[bi] = header80[36 + 31 - bi];
+        for (int bi = 0; bi < 4; bi++)  ntime_be[bi] = header80[68 + 3 - bi];
+        for (int bi = 0; bi < 4; bi++)  nbits_be[bi] = header80[72 + 3 - bi];
+        for (int bi = 0; bi < 4; bi++)  nonce_be[bi] = header80[76 + 3 - bi];
 
         bin2hex(ver_hex,   ver_be,   4);
         bin2hex(ntime_hex, ntime_be, 4);
@@ -407,6 +487,7 @@ static char const usage[] = "\nUsage: " PROGRAM_NAME " [OPTIONS]\nOptions:\n"
     "      --stratum-ping=N   ping interval seconds when idle (default: 60)\n"
     "      --debug-sample-canonical  sample one canonical digest per batch for display\n"
     "      --debug-lax-target    override share target to easy value (test submissions)\n"
+    "      --debug-merkle-both   log merkle roots using both concat orders per level\n"
     "  -h, --help            display this help text and exit\n";
 
 static char const short_options[] =
@@ -457,6 +538,7 @@ static struct option const options[] = {
     { "stratum-ping", 1, NULL, 1019 },
     { "debug-sample-canonical", 0, NULL, 1020 },
     { "debug-lax-target", 0, NULL, 1021 },
+    { "debug-merkle-both", 0, NULL, 1022 },
     { 0, 0, 0, 0 }
 };
 
@@ -925,22 +1007,31 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
     int i;
     bool rc = false;
 
-    /* Debug: compute and print canonical CPUNet block hash being submitted. */
+    /* Debug: compute and print CPUNet block hash from exact wire header bytes (matches server). */
     do {
-        uint32_t header_copy[20];
+        unsigned char header80[80];
         for (int hi = 0; hi < 20; hi++)
-            header_copy[hi] = work->data[hi]; /* use LE words as-is */
+            le32enc(header80 + 4 * hi, work->data[hi]);
         unsigned char digest[32], digest_rpc[32];
-        char hash_hex[65];
-        cpunet_digest_bytes_from_header(header_copy, digest);
+        /* CPUNet PoW: sha256d(header || "cpunet\0") */
+        unsigned char preimage[87];
+        memcpy(preimage, header80, 80);
+        memcpy(preimage + 80, "cpunet", 6);
+        preimage[86] = 0x00;
+        sha256d(digest, preimage, sizeof(preimage));
         for (int bi = 0; bi < 32; bi++) digest_rpc[bi] = digest[31 - bi];
+        char hash_hex[65];
         bin2hex(hash_hex, digest_rpc, 32);
+        uint32_t ntime_be = swab32(work->data[17]);
+        uint32_t bits_be  = swab32(work->data[18]);
+        uint32_t nonce_be = swab32(work->data[19]);
         applog(LOG_INFO, "submit: block_hash=%s nonce=%08x ntime=%08x bits=%08x",
-               hash_hex, header_copy[19], header_copy[17], header_copy[18]);
-        /* If debugging, enumerate alternative endianness interpretations. */
+               hash_hex, nonce_be, ntime_be, bits_be);
         if (opt_debug || opt_debug_lax_target) {
             applog(LOG_INFO, "Enumerating endianness variants (hash in RPC order):");
-            debug_dump_all_endian_hashes(header_copy);
+            uint32_t header_words[20];
+            for (int hi = 0; hi < 20; hi++) header_words[hi] = work->data[hi];
+            debug_dump_all_endian_hashes(header_words);
         }
     } while (0);
 
@@ -1323,11 +1414,56 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
     work->xnonce2 = realloc(work->xnonce2, sctx->xnonce2_size);
     memcpy(work->xnonce2, sctx->job.xnonce2, sctx->xnonce2_size);
 
-    /* Generate merkle root */
-    sha256d(merkle_root, sctx->job.coinbase, sctx->job.coinbase_size);
+    /* Generate merkle root (coinbase txid as leaf) */
+    if (!compute_txid_nonwitness(sctx->job.coinbase, sctx->job.coinbase_size, merkle_root)) {
+        /* Fallback: hash full coinbase bytes */
+        sha256d(merkle_root, sctx->job.coinbase, sctx->job.coinbase_size);
+    }
     for (i = 0; i < sctx->job.merkle_count; i++) {
         memcpy(merkle_root + 32, sctx->job.merkle[i], 32);
         sha256d(merkle_root, merkle_root, 64);
+    }
+
+    /* Optional: compute alternative merkle root using reversed concat order per level */
+    if (opt_debug_merkle_both) {
+        unsigned char cur[32], alt[32];
+        unsigned char buf[64];
+        /* Dump coinbase and extranonce layout */
+        {
+            char *cb_hex = abin2hex(sctx->job.coinbase, sctx->job.coinbase_size);
+            char *x1_hex = abin2hex(sctx->xnonce1, sctx->xnonce1_size);
+            char *x2_hex = abin2hex(sctx->job.xnonce2, sctx->xnonce2_size);
+            applog(LOG_INFO, "coinbase(size=%zu): %s", sctx->job.coinbase_size, cb_hex);
+            applog(LOG_INFO, "extranonce1(%zu): %s", sctx->xnonce1_size, x1_hex);
+            applog(LOG_INFO, "extranonce2(%zu): %s", sctx->xnonce2_size, x2_hex);
+            free(cb_hex); free(x1_hex); free(x2_hex);
+            applog(LOG_INFO, "merkle_branches: %d", sctx->job.merkle_count);
+        }
+        memcpy(cur, merkle_root, 32); /* current root from normal path */
+        /* Recompute both variants starting from coinbase txid to be precise */
+        if (!compute_txid_nonwitness(sctx->job.coinbase, sctx->job.coinbase_size, cur))
+            sha256d(cur, sctx->job.coinbase, sctx->job.coinbase_size);
+        memcpy(alt, cur, 32);
+        for (i = 0; i < sctx->job.merkle_count; i++) {
+            /* Normal: cur || branch */
+            memcpy(buf, cur, 32);
+            memcpy(buf + 32, sctx->job.merkle[i], 32);
+            sha256d(cur, buf, 64);
+            /* Alternative: branch || cur */
+            memcpy(buf, sctx->job.merkle[i], 32);
+            memcpy(buf + 32, alt, 32);
+            sha256d(alt, buf, 64);
+        }
+        /* Print both roots in RPC big-endian hex */
+        unsigned char cur_be[32], alt_be[32];
+        char cur_hex[65], alt_hex[65];
+        for (int bi = 0; bi < 32; bi++) { cur_be[bi] = cur[31 - bi]; alt_be[bi] = alt[31 - bi]; }
+        bin2hex(cur_hex, cur_be, 32);
+        bin2hex(alt_hex, alt_be, 32);
+        applog(LOG_INFO, "coinbase_txid (BE): %s", cur_hex);
+        applog(LOG_INFO, "merkle(normal cur||branch): %s", cur_hex);
+        applog(LOG_INFO, "merkle(alt branch||cur):   %s", alt_hex);
+        /* Note: header still uses the normal variant above */
     }
 
     /* Increment extranonce2 */
@@ -1335,13 +1471,17 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 
     /* Assemble block header */
     memset(work->data, 0, 128);
-    work->data[0] = swab32(le32dec(sctx->job.version));
+    /* version/ntime/nbits come from Stratum as big-endian hex; decode as BE */
+    work->data[0] = swab32(be32dec(sctx->job.version));
+    /* Stratum prevhash param is 32-byte BE hex. Header stores prevhash in LE bytes,
+       i.e., reverse the full 32 bytes. Achieve this by reversing 32-bit word order
+       and endian-swapping each word during serialization via le32enc later. */
     for (i = 0; i < 8; i++)
-        work->data[1 + i] = swab32(le32dec((uint32_t *)sctx->job.prevhash + i));
+        work->data[1 + i] = swab32(be32dec((uint32_t *)sctx->job.prevhash + (7 - i)));
     for (i = 0; i < 8; i++)
         work->data[9 + i] = swab32(be32dec((uint32_t *)merkle_root + i));
-    work->data[17] = swab32(le32dec(sctx->job.ntime));
-    work->data[18] = swab32(le32dec(sctx->job.nbits));
+    work->data[17] = swab32(be32dec(sctx->job.ntime));
+    work->data[18] = swab32(be32dec(sctx->job.nbits));
 
     work->version_mask = sctx->job.version_mask;
     pthread_mutex_unlock(&sctx->work_lock);
@@ -2388,6 +2528,9 @@ static void parse_arg(int key, char *arg, char *pname)
         break;
     case 1021:
         opt_debug_lax_target = true;
+        break;
+    case 1022:
+        opt_debug_merkle_both = true;
         break;
     case 'S':
         use_syslog = true;
