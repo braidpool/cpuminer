@@ -15,6 +15,11 @@
 #include <inttypes.h>
 #include <immintrin.h>
 
+/* Forward decls for CPU feature checks used before their definitions */
+#if defined(__x86_64__)
+static inline int cpu_has_avx(void);
+#endif
+
 /* cpunet string data */
 static const uint32_t cpunet_block2_part[] = {
     0x6370756e, /* bytes: 'c','p','u','n' (big-endian word) */
@@ -51,8 +56,7 @@ void cpunet_serialize_preimage(unsigned char *out87, const uint32_t *header20)
     for (int i = 0; i < 20; i++)
         le32enc(out87 + 4 * i, header20[i]);
     /* Append "cpunet" (6 bytes) and a trailing NUL (1 byte) */
-    memcpy(out87 + 80, "cpunet", 6);
-    out87[86] = 0x00;
+    memcpy(out87 + 80, "cpunet\0", 7);
 }
 
 /* Debug helper: recompute canonical CPUNet digest for a given header+nonce,
@@ -350,97 +354,56 @@ void sha256d_ms_shani(uint32_t *hash, uint32_t *W,
 }
 #endif
 
-/* Provide a safe, portable wrapper for sha256d_ms on x86_64: use VIA PadLock
- * (PHE) acceleration only when available; otherwise fall back to the C path.
- */
-#if defined(__x86_64__) && defined(USE_ASM)
-static inline int cpu_has_phe(void)
-{
-    unsigned int eax, ebx, ecx, edx;
-    /* Check for extended CPUID level */
-    eax = 0xC0000000u;
-    __asm__ __volatile__(
-        "cpuid"
-        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-        : "a"(eax), "c"(0)
-    );
-    if (eax < 0xC0000001u)
-        return 0;
-    /* Query VIA PadLock features */
-    eax = 0xC0000001u;
-    __asm__ __volatile__(
-        "cpuid"
-        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-        : "a"(eax), "c"(0)
-    );
-    /* Bits 10 and 11 (0x00000C00) indicate SHA (PHE) availability */
-    return (edx & 0x00000C00u) == 0x00000C00u;
-}
-
-static inline int cpu_has_shani(void)
-{
-    unsigned int eax, ebx, ecx, edx;
-    /* CPUID leaf 7, subleaf 0: EBX bit 29 = SHA */
-    eax = 7; ecx = 0;
-    __asm__ __volatile__("cpuid"
-        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-        : "a"(eax), "c"(ecx));
-    return (ebx & (1u << 29)) != 0;
-}
-
-static inline int cpu_has_avx512(void)
-{
-    unsigned int eax, ebx, ecx, edx;
-    /* AVX-512F check */
-    eax = 7; ecx = 0;
-    __asm__ __volatile__("cpuid"
-        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-        : "a"(eax), "c"(ecx));
-    int has_avx512f = (ebx & (1u << 16)) != 0;
-    if (!has_avx512f) return 0;
-    /* XGETBV: require Opmask, ZMM_hi256, Hi16_ZMM plus AVX state */
-    unsigned int xcr0_lo = 0, xcr0_hi = 0;
-    __asm__ __volatile__("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
-    unsigned int need = (1u << 1) | (1u << 2) | (1u << 5) | (1u << 6);
-    return ((xcr0_lo & need) == need);
-}
-
-static int g_printed_sha256d_ms_path = 0;
-void sha256d_ms(uint32_t *hash, uint32_t *W,
-    const uint32_t *midstate, const uint32_t *prehash)
-{
-    if (cpu_has_phe()) {
-        if (__sync_bool_compare_and_swap(&g_printed_sha256d_ms_path, 0, 1))
-            applog(LOG_INFO, "sha256d_ms path: padlock-phe");
-        sha256d_ms_phe(hash, W, midstate, prehash);
-    } else if (cpu_has_shani()) {
-        if (__sync_bool_compare_and_swap(&g_printed_sha256d_ms_path, 0, 1))
-            applog(LOG_INFO, "sha256d_ms path: sha-ni");
-        sha256d_ms_shani(hash, W, midstate, prehash);
-    } else {
-        if (__sync_bool_compare_and_swap(&g_printed_sha256d_ms_path, 0, 1))
-            applog(LOG_INFO, "sha256d_ms path: scalar-c");
-        sha256d_ms_c(hash, W, midstate, prehash);
-    }
-}
-#else
-/* Non-x86_64 or no ASM: always use the portable C path. */
-void sha256d_ms(uint32_t *hash, uint32_t *W,
-    const uint32_t *midstate, const uint32_t *prehash)
-{
-    sha256d_ms_c(hash, W, midstate, prehash);
-}
-#endif
-
-
-
-
 static const uint32_t sha256d_hash1[16] = {
     0x00000000, 0x00000000, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000,
     0x80000000, 0x00000000, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000100
 };
+
+/* Debug: verify second-pass W2 schedule and preextension fold-ins for a single header */
+static void debug_verify_w2_preext(const uint32_t header20[20])
+{
+    if (!opt_debug) return;
+    uint32_t pdata_be[20];
+    for (int i = 0; i < 20; ++i) pdata_be[i] = swab32(header20[i]);
+    uint32_t block2[16];
+    cpunet_build_block2(block2, pdata_be);
+    uint32_t mid[8];
+    sha256_init(mid);
+    sha256_transform(mid, pdata_be, 0);
+    /* First-pass digest words become W2[0..7] */
+    uint32_t W2a[64], W2b[64];
+    for (int i = 0; i < 8; i++) { W2a[i] = mid[i]; W2b[i] = mid[i]; }
+    for (int i = 8; i < 16; i++) { W2a[i] = sha256d_hash1[i]; W2b[i] = sha256d_hash1[i]; }
+    for (int i = 16; i < 64; i++) {
+        W2a[i] = s1(W2a[i-2]) + W2a[i-7] + s0(W2a[i-15]) + W2a[i-16];
+        W2b[i] = s1(W2b[i-2]) + W2b[i-7] + s0(W2b[i-15]) + W2b[i-16];
+    }
+    /* Apply preextension fold-ins to the scalar schedule for comparison */
+    W2b[17] += 0x00a00000u;
+    W2b[23] += 0x11002000u;
+    W2b[24] += 0x80000000u;
+    W2b[30] += 0x00400022u;
+    /* Compress both and compare outputs */
+    uint32_t Sa[8], Sb[8];
+    uint32_t t0 = 0, t1 = 0;
+    sha256_init(Sa); sha256_init(Sb);
+    for (int r = 0; r < 64; r++) {
+        RNDr(Sa, W2a, r);
+        RNDr(Sb, W2b, r);
+    }
+    for (int i = 0; i < 8; i++) { Sa[i] += sha256_h[i]; Sb[i] += sha256_h[i]; }
+    int diff = memcmp(Sa, Sb, sizeof(Sa));
+    if (diff != 0) {
+        applog(LOG_DEBUG, "DEBUG preext2 scalar check mismatch: Sa != Sb");
+    } else {
+        applog(LOG_DEBUG, "DEBUG preext2 scalar check OK: Sa == Sb");
+    }
+    /* Print key schedule words for manual mapping */
+    applog(LOG_DEBUG, "DEBUG W2[17]=%08x W2[23]=%08x W2[24]=%08x W2[30]=%08x",
+           W2a[17], W2a[23], W2a[24], W2a[30]);
+}
 
 static void sha256d_80_swap(uint32_t *hash, const uint32_t *data)
 {
@@ -456,9 +419,6 @@ static void sha256d_80_swap(uint32_t *hash, const uint32_t *data)
     for (i = 0; i < 8; i++)
         hash[i] = swab32(hash[i]);
 }
-
-/* Removed OpenSSL double-check path. All validations use fast-path hash with
- * correct endianness conversion followed by fulltest(). */
 
 /* Compute CPUNet digest via the optimized fast-path for a single header (nonce in pdata[19]). */
 /* cpunet_hash_fast and cpunet_selfcheck are defined later, after helpers. */
@@ -476,9 +436,10 @@ void sha256d(unsigned char *hash, const unsigned char *data, int len)
         if (r >= 0 && r < 64)
             ((unsigned char *)T)[r] = 0x80;
         for (i = 0; i < 16; i++)
-            T[i] = be32dec(T + i);
+            T[i] = be32dec((unsigned char*)T + i*4);
         if (r < 56)
             T[15] = 8 * len;
+
         sha256_transform(S, T, 0);
     }
     memcpy(S + 8, sha256d_hash1 + 8, 32);
@@ -487,6 +448,7 @@ void sha256d(unsigned char *hash, const unsigned char *data, int len)
     for (i = 0; i < 8; i++)
         be32enc((uint32_t *)hash + i, T[i]);
 }
+
 
 static inline void sha256d_preextend(uint32_t *W)
 {
@@ -542,7 +504,9 @@ void sha256d_ms_phe(uint32_t *hash, uint32_t *W,
 
 #else
 
-static inline void sha256d_ms(uint32_t *hash, uint32_t *W,
+/* Keep an optimized reference variant available, but avoid naming clash with
+ * the dispatcher above. */
+static inline void sha256d_ms_opt(uint32_t *hash, uint32_t *W,
     const uint32_t *midstate, const uint32_t *prehash)
 {
     uint32_t S[64];
@@ -754,6 +718,162 @@ static inline void sha256d_ms(uint32_t *hash, uint32_t *W,
 void sha256d_ms_4way(uint32_t *hash,  uint32_t *data,
     const uint32_t *midstate, const uint32_t *prehash);
 
+void sha256d_ms(uint32_t *hash, uint32_t *W,
+    const uint32_t *midstate, const uint32_t *prehash);
+
+/* Correctness-first C reference for 4-way: derive each lane from scalar path. */
+static inline void sha256d_ms_4way_c(uint32_t *hash, uint32_t *data,
+    const uint32_t *midstate, const uint32_t *prehash)
+{
+    for (int lane = 0; lane < 4; lane++) {
+        uint32_t W[64];
+        /* gather lane's block words */
+        for (int i = 0; i < 16; i++) W[i] = data[i * 4 + lane];
+        sha256d_preextend(W);
+        uint32_t ms[8], ph[8], out[8];
+        for (int i = 0; i < 8; i++) {
+            ms[i] = midstate[i * 4 + lane];
+            ph[i] = prehash[i * 4 + lane];
+        }
+        sha256d_ms(out, W, ms, ph);
+        for (int i = 0; i < 8; i++) hash[i * 4 + lane] = out[i];
+    }
+}
+
+/* SSE2 4-way SIMD kernel */
+static inline __m128i sse_rotr32(__m128i x, int n) {
+    return _mm_or_si128(_mm_srli_epi32(x, n), _mm_slli_epi32(x, 32 - n));
+}
+static inline __m128i sse_S0(__m128i x) {
+    return _mm_xor_si128(_mm_xor_si128(sse_rotr32(x, 2), sse_rotr32(x, 13)), sse_rotr32(x, 22));
+}
+static inline __m128i sse_S1(__m128i x) {
+    return _mm_xor_si128(_mm_xor_si128(sse_rotr32(x, 6), sse_rotr32(x, 11)), sse_rotr32(x, 25));
+}
+static inline __m128i sse_s0(__m128i x) {
+    return _mm_xor_si128(_mm_xor_si128(sse_rotr32(x, 7), sse_rotr32(x, 18)), _mm_srli_epi32(x, 3));
+}
+static inline __m128i sse_s1(__m128i x) {
+    return _mm_xor_si128(_mm_xor_si128(sse_rotr32(x, 17), sse_rotr32(x, 19)), _mm_srli_epi32(x, 10));
+}
+
+static void sha256d_ms_4way_simd(uint32_t *hash, uint32_t *data,
+    const uint32_t *midstate, const uint32_t *prehash)
+{
+    /* Pre-broadcasted K constants to avoid set1 in the round loop */
+    static __m128i K4[64];
+    static int K4_init = 0;
+    if (!K4_init) {
+        for (int i = 0; i < 64; i++) K4[i] = _mm_set1_epi32((int)sha256_k[i]);
+        K4_init = 1;
+    }
+    __m128i W[16];
+    const __m128i *d4 = (const __m128i *) __builtin_assume_aligned(data, 16);
+    for (int i = 0; i < 16; i++)
+        W[i] = _mm_load_si128(d4 + i);
+    __m128i A = _mm_set_epi32((int)midstate[0*4+3], (int)midstate[0*4+2], (int)midstate[0*4+1], (int)midstate[0*4+0]);
+    __m128i B = _mm_set_epi32((int)midstate[1*4+3], (int)midstate[1*4+2], (int)midstate[1*4+1], (int)midstate[1*4+0]);
+    __m128i C = _mm_set_epi32((int)midstate[2*4+3], (int)midstate[2*4+2], (int)midstate[2*4+1], (int)midstate[2*4+0]);
+    __m128i D = _mm_set_epi32((int)midstate[3*4+3], (int)midstate[3*4+2], (int)midstate[3*4+1], (int)midstate[3*4+0]);
+    __m128i E = _mm_set_epi32((int)midstate[4*4+3], (int)midstate[4*4+2], (int)midstate[4*4+1], (int)midstate[4*4+0]);
+    __m128i F = _mm_set_epi32((int)midstate[5*4+3], (int)midstate[5*4+2], (int)midstate[5*4+1], (int)midstate[5*4+0]);
+    __m128i G = _mm_set_epi32((int)midstate[6*4+3], (int)midstate[6*4+2], (int)midstate[6*4+1], (int)midstate[6*4+0]);
+    __m128i H = _mm_set_epi32((int)midstate[7*4+3], (int)midstate[7*4+2], (int)midstate[7*4+1], (int)midstate[7*4+0]);
+    __m128i SA=A, SB=B, SC=C, SD=D, SE=E, SF=F, SG=G, SH=H;
+    #define SSE_ROUND(AA,BB,CC,DD,EE,FF,GG,HH, WT, KI) do { \
+        __m128i ch = _mm_xor_si128(_mm_and_si128((EE),(FF)), _mm_andnot_si128((EE),(GG))); \
+        __m128i t1 = _mm_add_epi32((HH), _mm_add_epi32(sse_S1(EE), _mm_add_epi32(ch, _mm_add_epi32((WT),(KI))))); \
+        __m128i maj = _mm_xor_si128(_mm_xor_si128(_mm_and_si128((AA),(BB)), _mm_and_si128((AA),(CC))), _mm_and_si128((BB),(CC))); \
+        __m128i t2 = _mm_add_epi32(sse_S0(AA), maj); \
+        (DD) = _mm_add_epi32((DD), t1); \
+        (HH) = _mm_add_epi32(t1, t2); \
+        __m128i tmp_ = (HH); (HH) = (GG); (GG) = (FF); (FF) = (EE); (EE) = (DD); (DD) = (CC); (CC) = (BB); (BB) = (AA); (AA) = tmp_; \
+    } while(0)
+
+    for (int i = 0; i < 64; i += 4) {
+        int t0 = (i + 0) & 15; int t1i = (i + 1) & 15; int t2i = (i + 2) & 15; int t3 = (i + 3) & 15;
+        if (i >= 16) {
+            W[t0] = _mm_add_epi32(_mm_add_epi32(sse_s1(W[(t0 + 14) & 15]), W[(t0 + 9) & 15]), _mm_add_epi32(sse_s0(W[(t0 + 1) & 15]), W[t0]));
+            W[t1i] = _mm_add_epi32(_mm_add_epi32(sse_s1(W[(t1i + 14) & 15]), W[(t1i + 9) & 15]), _mm_add_epi32(sse_s0(W[(t1i + 1) & 15]), W[t1i]));
+            W[t2i] = _mm_add_epi32(_mm_add_epi32(sse_s1(W[(t2i + 14) & 15]), W[(t2i + 9) & 15]), _mm_add_epi32(sse_s0(W[(t2i + 1) & 15]), W[t2i]));
+            W[t3] = _mm_add_epi32(_mm_add_epi32(sse_s1(W[(t3 + 14) & 15]), W[(t3 + 9) & 15]), _mm_add_epi32(sse_s0(W[(t3 + 1) & 15]), W[t3]));
+        }
+        SSE_ROUND(A,B,C,D,E,F,G,H, W[t0], K4[i+0]);
+        SSE_ROUND(A,B,C,D,E,F,G,H, W[t1i], K4[i+1]);
+        SSE_ROUND(A,B,C,D,E,F,G,H, W[t2i], K4[i+2]);
+        SSE_ROUND(A,B,C,D,E,F,G,H, W[t3], K4[i+3]);
+    }
+    #undef SSE_ROUND
+    A = _mm_add_epi32(A, SA); B = _mm_add_epi32(B, SB); C = _mm_add_epi32(C, SC); D = _mm_add_epi32(D, SD);
+    E = _mm_add_epi32(E, SE); F = _mm_add_epi32(F, SF); G = _mm_add_epi32(G, SG); H = _mm_add_epi32(H, SH);
+
+    __m128i W2[16];
+    static __m128i P2_17_4, P2_23_4, P2_24_4, P2_30_4; static int P2_4_init=0; static int use_preext2_4=1;
+    if (!P2_4_init) { P2_17_4=_mm_set1_epi32(0x00a00000); P2_23_4=_mm_set1_epi32(0x11002000); P2_24_4=_mm_set1_epi32(0x80000000); P2_30_4=_mm_set1_epi32(0x00400022); P2_4_init=1; }
+    W2[0]=A; W2[1]=B; W2[2]=C; W2[3]=D; W2[4]=E; W2[5]=F; W2[6]=G; W2[7]=H;
+    for (int i = 8; i < 16; i++) W2[i] = _mm_set1_epi32((int)sha256d_hash1[i]);
+    A = _mm_set1_epi32((int)sha256_h[0]); B = _mm_set1_epi32((int)sha256_h[1]);
+    C = _mm_set1_epi32((int)sha256_h[2]); D = _mm_set1_epi32((int)sha256_h[3]);
+    E = _mm_set1_epi32((int)sha256_h[4]); F = _mm_set1_epi32((int)sha256_h[5]);
+    G = _mm_set1_epi32((int)sha256_h[6]); H = _mm_set1_epi32((int)sha256_h[7]);
+    #define SSE_ROUND2(AA,BB,CC,DD,EE,FF,GG,HH, WT, KI) do { \
+        __m128i ch = _mm_xor_si128(_mm_and_si128((EE),(FF)), _mm_andnot_si128((EE),(GG))); \
+        __m128i t1 = _mm_add_epi32((HH), _mm_add_epi32(sse_S1(EE), _mm_add_epi32(ch, _mm_add_epi32((WT),(KI))))); \
+        __m128i maj = _mm_xor_si128(_mm_xor_si128(_mm_and_si128((AA),(BB)), _mm_and_si128((AA),(CC))), _mm_and_si128((BB),(CC))); \
+        __m128i t2 = _mm_add_epi32(sse_S0(AA), maj); \
+        (DD) = _mm_add_epi32((DD), t1); \
+        (HH) = _mm_add_epi32(t1, t2); \
+        __m128i tmp_ = (HH); (HH) = (GG); (GG) = (FF); (FF) = (EE); (EE) = (DD); (DD) = (CC); (CC) = (BB); (BB) = (AA); (AA) = tmp_; \
+    } while(0)
+
+    for (int i = 0; i < 64; i += 4) {
+        int t0 = (i + 0) & 15; int t1i = (i + 1) & 15; int t2i = (i + 2) & 15; int t3 = (i + 3) & 15;
+        if (i >= 16) {
+            W2[t0] = _mm_add_epi32(_mm_add_epi32(sse_s1(W2[(t0 + 14) & 15]), W2[(t0 + 9) & 15]), _mm_add_epi32(sse_s0(W2[(t0 + 1) & 15]), W2[t0]));
+            if (use_preext2_4) { if (i+0 == 17) W2[t0] = _mm_add_epi32(W2[t0], P2_17_4); }
+            W2[t1i] = _mm_add_epi32(_mm_add_epi32(sse_s1(W2[(t1i + 14) & 15]), W2[(t1i + 9) & 15]), _mm_add_epi32(sse_s0(W2[(t1i + 1) & 15]), W2[t1i]));
+            if (use_preext2_4) { if (i+1 == 23) W2[t1i] = _mm_add_epi32(W2[t1i], P2_23_4); }
+            W2[t2i] = _mm_add_epi32(_mm_add_epi32(sse_s1(W2[(t2i + 14) & 15]), W2[(t2i + 9) & 15]), _mm_add_epi32(sse_s0(W2[(t2i + 1) & 15]), W2[t2i]));
+            if (use_preext2_4) { if (i+2 == 24) W2[t2i] = _mm_add_epi32(W2[t2i], P2_24_4); }
+            W2[t3] = _mm_add_epi32(_mm_add_epi32(sse_s1(W2[(t3 + 14) & 15]), W2[(t3 + 9) & 15]), _mm_add_epi32(sse_s0(W2[(t3 + 1) & 15]), W2[t3]));
+            if (use_preext2_4) { if (i+3 == 30) W2[t3] = _mm_add_epi32(W2[t3], P2_30_4); }
+        }
+        SSE_ROUND2(A,B,C,D,E,F,G,H, W2[t0], K4[i+0]);
+        SSE_ROUND2(A,B,C,D,E,F,G,H, W2[t1i], K4[i+1]);
+        SSE_ROUND2(A,B,C,D,E,F,G,H, W2[t2i], K4[i+2]);
+        SSE_ROUND2(A,B,C,D,E,F,G,H, W2[t3], K4[i+3]);
+    }
+    #undef SSE_ROUND2
+    A = _mm_add_epi32(A, _mm_set1_epi32((int)sha256_h[0]));
+    B = _mm_add_epi32(B, _mm_set1_epi32((int)sha256_h[1]));
+    C = _mm_add_epi32(C, _mm_set1_epi32((int)sha256_h[2]));
+    D = _mm_add_epi32(D, _mm_set1_epi32((int)sha256_h[3]));
+    E = _mm_add_epi32(E, _mm_set1_epi32((int)sha256_h[4]));
+    F = _mm_add_epi32(F, _mm_set1_epi32((int)sha256_h[5]));
+    G = _mm_add_epi32(G, _mm_set1_epi32((int)sha256_h[6]));
+    H = _mm_add_epi32(H, _mm_set1_epi32((int)sha256_h[7]));
+
+    uint32_t tmpv[4];
+    _mm_storeu_si128((__m128i*)tmpv, A); for (int lane=0; lane<4; lane++) hash[0*4+lane]=tmpv[lane];
+    _mm_storeu_si128((__m128i*)tmpv, B); for (int lane=0; lane<4; lane++) hash[1*4+lane]=tmpv[lane];
+    _mm_storeu_si128((__m128i*)tmpv, C); for (int lane=0; lane<4; lane++) hash[2*4+lane]=tmpv[lane];
+    _mm_storeu_si128((__m128i*)tmpv, D); for (int lane=0; lane<4; lane++) hash[3*4+lane]=tmpv[lane];
+    _mm_storeu_si128((__m128i*)tmpv, E); for (int lane=0; lane<4; lane++) hash[4*4+lane]=tmpv[lane];
+    _mm_storeu_si128((__m128i*)tmpv, F); for (int lane=0; lane<4; lane++) hash[5*4+lane]=tmpv[lane];
+    _mm_storeu_si128((__m128i*)tmpv, G); for (int lane=0; lane<4; lane++) hash[6*4+lane]=tmpv[lane];
+    _mm_storeu_si128((__m128i*)tmpv, H); for (int lane=0; lane<4; lane++) hash[7*4+lane]=tmpv[lane];
+}
+
+/* 4-way AVX variant: same logic, compiled with AVX target to enable VEX encoding */
+#if defined(__GNUC__)
+__attribute__((target("avx")))
+#endif
+static void sha256d_ms_4way_avx(uint32_t *hash, uint32_t *data,
+    const uint32_t *midstate, const uint32_t *prehash)
+{
+    sha256d_ms_4way_simd(hash, data, midstate, prehash);
+}
+
 static inline int scanhash_sha256d_4way(int thr_id, uint32_t *pdata,
     const uint32_t *ptarget, uint32_t max_nonce, unsigned long *hashes_done)
 {
@@ -767,16 +887,17 @@ static inline int scanhash_sha256d_4way(int thr_id, uint32_t *pdata,
     int i, j;
 
     uint32_t block2[16];
-    cpunet_build_block2(block2, pdata);
-
-    memcpy(data, block2, 64);
-    sha256d_preextend(data);
-    for (i = 31; i >= 0; i--)
+    /* Build big-endian view of header words for midstate and block2 */
+    uint32_t pdata_be[20];
+    for (i = 0; i < 20; ++i) pdata_be[i] = swab32(pdata[i]);
+    cpunet_build_block2(block2, pdata_be);
+    for (i = 0; i < 16; i++)
         for (j = 0; j < 4; j++)
-            data[i * 4 + j] = data[i];
+            data[i * 4 + j] = block2[i];
 
     sha256_init(midstate);
-    sha256_transform(midstate, pdata, 0);
+    /* Use big-endian word view for SHA256 midstate */
+    sha256_transform(midstate, pdata_be, 0);
     memcpy(prehash, midstate, 32);
     sha256d_prehash(prehash, block2);
     for (i = 7; i >= 0; i--) {
@@ -785,23 +906,37 @@ static inline int scanhash_sha256d_4way(int thr_id, uint32_t *pdata,
             prehash[i * 4 + j] = prehash[i];
         }
     }
+    uint32_t midstate_one[8], prehash_one[8];
+    memcpy(midstate_one, midstate, 32);
+    memcpy(prehash_one, prehash, 32);
 
     do {
+        /* normal vector path */
         for (i = 0; i < 4; i++)
-            data[4 * 3 + i] = ++n;
+            data[4 * 3 + i] = swab32(++n);
 
-        sha256d_ms_4way(hash, data, midstate, prehash);
+        /* Use 4-way AVX kernel if AVX is available, else SSE2 */
+        if (
+#if defined(__x86_64__)
+            cpu_has_avx()
+#else
+            0
+#endif
+           )
+            sha256d_ms_4way_avx(hash, data, midstate, prehash);
+        else
+            sha256d_ms_4way_simd(hash, data, midstate, prehash);
 
         /* Report only the best lane for diagnostics to reduce overhead. */
         int best_lane = 0;
         for (i = 1; i < 4; i++) {
-            if (words_leq_256(&hash[8 * i], &hash[8 * best_lane]))
+            if (words_leq_256(&hash[4 * i], &hash[4 * best_lane]))
                 best_lane = i;
         }
-        miner_report_candidate(thr_id, pdata, data[4 * 3 + best_lane], swab32(hash[4 * 7 + best_lane]));
+        miner_report_candidate(thr_id, pdata, swab32(data[4 * 3 + best_lane]), swab32(hash[4 * 7 + best_lane]));
 
         for (i = 0; i < 4; i++) {
-            uint32_t lane_nonce = data[4 * 3 + i];
+            uint32_t lane_nonce = swab32(data[4 * 3 + i]);
             if (lane_nonce > max_nonce)
                 continue; /* respect max_nonce bound for final batch */
             if (swab32(hash[4 * 7 + i]) <= Htarg) {
@@ -812,9 +947,18 @@ static inline int scanhash_sha256d_4way(int thr_id, uint32_t *pdata,
                 }
 
                 pdata[19] = lane_nonce;
-                if (cpunet_validate_and_print(i, pdata, lane_nonce, ptarget)) {
-                    *hashes_done = n - first_nonce + 1;
-                    return 1;
+                if (opt_debug) {
+                    if (cpunet_validate_and_print(i, pdata, lane_nonce, ptarget)) {
+                        *hashes_done = n - first_nonce + 1;
+                        return 1;
+                    }
+                } else {
+                    uint32_t canon2[8];
+                    for (int j3 = 0; j3 < 8; j3++) canon2[j3] = swab32(hash[4 * j3 + i]);
+                    if (fulltest(canon2, ptarget)) {
+                        *hashes_done = n - first_nonce + 1;
+                        return 1;
+                    }
                 }
             }
         }
@@ -832,6 +976,194 @@ static inline int scanhash_sha256d_4way(int thr_id, uint32_t *pdata,
 void sha256d_ms_8way(uint32_t *hash,  uint32_t *data,
     const uint32_t *midstate, const uint32_t *prehash);
 
+/* Correctness-first C reference for 8-way: derive each lane from scalar path. */
+static inline void sha256d_ms_8way_c(uint32_t *hash, uint32_t *data,
+    const uint32_t *midstate, const uint32_t *prehash)
+{
+    for (int lane = 0; lane < 8; lane++) {
+        uint32_t W[64];
+        for (int i = 0; i < 16; i++) W[i] = data[i * 8 + lane];
+        sha256d_preextend(W);
+        uint32_t ms[8], ph[8], out[8];
+        for (int i = 0; i < 8; i++) {
+            ms[i] = midstate[i * 8 + lane];
+            ph[i] = prehash[i * 8 + lane];
+        }
+        sha256d_ms(out, W, ms, ph);
+        for (int i = 0; i < 8; i++) hash[i * 8 + lane] = out[i];
+    }
+}
+
+/* AVX2 helpers at file scope to avoid nested function definitions */
+#if defined(__x86_64__)
+#if defined(__GNUC__)
+__attribute__((target("avx2")))
+#endif
+static inline __m256i avx2_ror32(__m256i x, int n) {
+    return _mm256_or_si256(_mm256_srli_epi32(x, n), _mm256_slli_epi32(x, 32 - n));
+}
+#if defined(__GNUC__)
+__attribute__((target("avx2")))
+#endif
+static inline __m256i avx2_S0(__m256i x) {
+    return _mm256_xor_si256(_mm256_xor_si256(avx2_ror32(x,2), avx2_ror32(x,13)), avx2_ror32(x,22));
+}
+#if defined(__GNUC__)
+__attribute__((target("avx2")))
+#endif
+static inline __m256i avx2_S1(__m256i x) {
+    return _mm256_xor_si256(_mm256_xor_si256(avx2_ror32(x,6), avx2_ror32(x,11)), avx2_ror32(x,25));
+}
+#if defined(__GNUC__)
+__attribute__((target("avx2")))
+#endif
+static inline __m256i avx2_s0(__m256i x) {
+    return _mm256_xor_si256(_mm256_xor_si256(avx2_ror32(x,7), avx2_ror32(x,18)), _mm256_srli_epi32(x,3));
+}
+#if defined(__GNUC__)
+__attribute__((target("avx2")))
+#endif
+static inline __m256i avx2_s1(__m256i x) {
+    return _mm256_xor_si256(_mm256_xor_si256(avx2_ror32(x,17), avx2_ror32(x,19)), _mm256_srli_epi32(x,10));
+}
+
+#if defined(__GNUC__)
+__attribute__((target("avx2")))
+#endif
+static void sha256d_ms_8way_simd(uint32_t *hash, uint32_t *data,
+    const uint32_t *midstate, const uint32_t *prehash)
+{
+    static __m256i K8[64];
+    static int K8_init = 0;
+    if (!K8_init) {
+        for (int i = 0; i < 64; i++) K8[i] = _mm256_set1_epi32((int)sha256_k[i]);
+        K8_init = 1;
+    }
+    __m256i W[16];
+    const __m256i *d8 = (const __m256i *) __builtin_assume_aligned(data, 32);
+    for (int i = 0; i < 16; i++)
+        W[i] = _mm256_load_si256(d8 + i);
+    __m256i A = _mm256_set_epi32((int)midstate[0*8+7],(int)midstate[0*8+6],(int)midstate[0*8+5],(int)midstate[0*8+4],(int)midstate[0*8+3],(int)midstate[0*8+2],(int)midstate[0*8+1],(int)midstate[0*8+0]);
+    __m256i B = _mm256_set_epi32((int)midstate[1*8+7],(int)midstate[1*8+6],(int)midstate[1*8+5],(int)midstate[1*8+4],(int)midstate[1*8+3],(int)midstate[1*8+2],(int)midstate[1*8+1],(int)midstate[1*8+0]);
+    __m256i C = _mm256_set_epi32((int)midstate[2*8+7],(int)midstate[2*8+6],(int)midstate[2*8+5],(int)midstate[2*8+4],(int)midstate[2*8+3],(int)midstate[2*8+2],(int)midstate[2*8+1],(int)midstate[2*8+0]);
+    __m256i D = _mm256_set_epi32((int)midstate[3*8+7],(int)midstate[3*8+6],(int)midstate[3*8+5],(int)midstate[3*8+4],(int)midstate[3*8+3],(int)midstate[3*8+2],(int)midstate[3*8+1],(int)midstate[3*8+0]);
+    __m256i E = _mm256_set_epi32((int)midstate[4*8+7],(int)midstate[4*8+6],(int)midstate[4*8+5],(int)midstate[4*8+4],(int)midstate[4*8+3],(int)midstate[4*8+2],(int)midstate[4*8+1],(int)midstate[4*8+0]);
+    __m256i F = _mm256_set_epi32((int)midstate[5*8+7],(int)midstate[5*8+6],(int)midstate[5*8+5],(int)midstate[5*8+4],(int)midstate[5*8+3],(int)midstate[5*8+2],(int)midstate[5*8+1],(int)midstate[5*8+0]);
+    __m256i G = _mm256_set_epi32((int)midstate[6*8+7],(int)midstate[6*8+6],(int)midstate[6*8+5],(int)midstate[6*8+4],(int)midstate[6*8+3],(int)midstate[6*8+2],(int)midstate[6*8+1],(int)midstate[6*8+0]);
+    __m256i H = _mm256_set_epi32((int)midstate[7*8+7],(int)midstate[7*8+6],(int)midstate[7*8+5],(int)midstate[7*8+4],(int)midstate[7*8+3],(int)midstate[7*8+2],(int)midstate[7*8+1],(int)midstate[7*8+0]);
+    __m256i SA=A,SB=B,SC=C,SD=D,SE=E,SF=F,SG=G,SH=H;
+    #if defined(__GNUC__)
+    #pragma GCC unroll 8
+    #endif
+    for (int i=0;i<64;i++){
+        int t = i & 15;
+        if (i >= 16) {
+            __m256i wim2 = W[(t + 14) & 15];
+            __m256i wim7 = W[(t + 9) & 15];
+            __m256i wim15 = W[(t + 1) & 15];
+            __m256i wim16 = W[t];
+            W[t] = _mm256_add_epi32(_mm256_add_epi32(avx2_s1(wim2), wim7), _mm256_add_epi32(avx2_s0(wim15), wim16));
+        }
+        const __m256i Ki = K8[i];
+        __m256i ch = _mm256_xor_si256(_mm256_and_si256(E,F), _mm256_andnot_si256(E,G));
+        __m256i t1 = _mm256_add_epi32(H, _mm256_add_epi32(_mm256_add_epi32(Ki, W[t]), _mm256_add_epi32(ch, avx2_S1(E))));
+        __m256i maj = _mm256_xor_si256(_mm256_xor_si256(_mm256_and_si256(A,B), _mm256_and_si256(A,C)), _mm256_and_si256(B,C));
+        __m256i t2 = _mm256_add_epi32(maj, avx2_S0(A));
+        D = _mm256_add_epi32(D, t1);
+        H = _mm256_add_epi32(t1, t2);
+        __m256i tmp=H; H=G; G=F; F=E; E=D; D=C; C=B; B=A; A=tmp;
+    }
+    A=_mm256_add_epi32(A,SA);B=_mm256_add_epi32(B,SB);C=_mm256_add_epi32(C,SC);D=_mm256_add_epi32(D,SD);
+    E=_mm256_add_epi32(E,SE);F=_mm256_add_epi32(F,SF);G=_mm256_add_epi32(G,SG);H=_mm256_add_epi32(H,SH);
+    __m256i W2v[16];
+    W2v[0]=A;W2v[1]=B;W2v[2]=C;W2v[3]=D;W2v[4]=E;W2v[5]=F;W2v[6]=G;W2v[7]=H;
+    for (int i=8;i<16;i++) W2v[i]=_mm256_set1_epi32((int)sha256d_hash1[i]);
+    A=_mm256_set1_epi32((int)sha256_h[0]);B=_mm256_set1_epi32((int)sha256_h[1]);
+    C=_mm256_set1_epi32((int)sha256_h[2]);D=_mm256_set1_epi32((int)sha256_h[3]);
+    E=_mm256_set1_epi32((int)sha256_h[4]);F=_mm256_set1_epi32((int)sha256_h[5]);
+    G=_mm256_set1_epi32((int)sha256_h[6]);H=_mm256_set1_epi32((int)sha256_h[7]);
+    static __m256i P2_17_8, P2_23_8, P2_24_8, P2_30_8; static int P2_8_init=0; static int use_preext2_8=1;
+    if (!P2_8_init) { P2_17_8=_mm256_set1_epi32(0x00a00000); P2_23_8=_mm256_set1_epi32(0x11002000); P2_24_8=_mm256_set1_epi32(0x80000000); P2_30_8=_mm256_set1_epi32(0x00400022); P2_8_init=1; }
+    /* JIT schedule: do not precompute W2[16..31]; extend on-demand per round */
+    int primed_count = 16;
+    /* 4-round unrolled second pass with inline fold-ins at i+offset */
+    #define AVX2_ROUND2(AA,BB,CC,DD,EE,FF,GG,HH, WT, KI) do { \
+        __m256i ch_ = _mm256_xor_si256(_mm256_and_si256((EE),(FF)), _mm256_andnot_si256((EE),(GG))); \
+        __m256i t1_ = _mm256_add_epi32((HH), _mm256_add_epi32(avx2_S1(EE), _mm256_add_epi32(ch_, _mm256_add_epi32((WT),(KI))))); \
+        __m256i maj_ = _mm256_xor_si256(_mm256_xor_si256(_mm256_and_si256((AA),(BB)), _mm256_and_si256((AA),(CC))), _mm256_and_si256((BB),(CC))); \
+        __m256i t2_ = _mm256_add_epi32(avx2_S0(AA), maj_); \
+        (DD) = _mm256_add_epi32((DD), t1_); \
+        (HH) = _mm256_add_epi32(t1_, t2_); \
+        __m256i tmp_ = (HH); (HH) = (GG); (GG) = (FF); (FF) = (EE); (EE) = (DD); (DD) = (CC); (CC) = (BB); (BB) = (AA); (AA) = tmp_; \
+    } while(0)
+
+    for (int i = 0; i < 64; i += 4) {
+        int t0 = (i + 0) & 15; int t1i = (i + 1) & 15; int t2i = (i + 2) & 15; int t3 = (i + 3) & 15;
+        if (i >= 16) {
+            __m256i w0_i2 = W2v[(t0 + 14) & 15];
+            __m256i w0_i7 = W2v[(t0 + 9) & 15];
+            __m256i w0_i15= W2v[(t0 + 1) & 15];
+            __m256i w0_i16= W2v[t0];
+            __m256i w0 = _mm256_add_epi32(_mm256_add_epi32(avx2_s1(w0_i2), w0_i7), _mm256_add_epi32(avx2_s0(w0_i15), w0_i16));
+            if (use_preext2_8 && (i + 0) < 32) { if (i + 0 == 17) w0 = _mm256_add_epi32(w0, P2_17_8); }
+            W2v[t0] = w0;
+
+            __m256i w1_i2 = W2v[(t1i + 14) & 15];
+            __m256i w1_i7 = W2v[(t1i + 9) & 15];
+            __m256i w1_i15= W2v[(t1i + 1) & 15];
+            __m256i w1_i16= W2v[t1i];
+            __m256i w1 = _mm256_add_epi32(_mm256_add_epi32(avx2_s1(w1_i2), w1_i7), _mm256_add_epi32(avx2_s0(w1_i15), w1_i16));
+            if (use_preext2_8 && (i + 1) < 32) { if (i + 1 == 23) w1 = _mm256_add_epi32(w1, P2_23_8); }
+            W2v[t1i] = w1;
+
+            __m256i w2_i2 = W2v[(t2i + 14) & 15];
+            __m256i w2_i7 = W2v[(t2i + 9) & 15];
+            __m256i w2_i15= W2v[(t2i + 1) & 15];
+            __m256i w2_i16= W2v[t2i];
+            __m256i w2 = _mm256_add_epi32(_mm256_add_epi32(avx2_s1(w2_i2), w2_i7), _mm256_add_epi32(avx2_s0(w2_i15), w2_i16));
+            if (use_preext2_8 && (i + 2) < 32) { if (i + 2 == 24) w2 = _mm256_add_epi32(w2, P2_24_8); }
+            W2v[t2i] = w2;
+
+            __m256i w3_i2 = W2v[(t3 + 14) & 15];
+            __m256i w3_i7 = W2v[(t3 + 9) & 15];
+            __m256i w3_i15= W2v[(t3 + 1) & 15];
+            __m256i w3_i16= W2v[t3];
+            __m256i w3 = _mm256_add_epi32(_mm256_add_epi32(avx2_s1(w3_i2), w3_i7), _mm256_add_epi32(avx2_s0(w3_i15), w3_i16));
+            if (use_preext2_8 && (i + 3) < 32) { if (i + 3 == 30) w3 = _mm256_add_epi32(w3, P2_30_8); }
+            W2v[t3] = w3;
+        }
+        if (opt_debug && i >= 16 && i < 32) {
+            applog(LOG_DEBUG, "DBG 8way second-pass map: i=%d t=%d preext=%d", i+0, t0, use_preext2_8);
+            applog(LOG_DEBUG, "DBG 8way second-pass map: i=%d t=%d preext=%d", i+1, t1i, use_preext2_8);
+            applog(LOG_DEBUG, "DBG 8way second-pass map: i=%d t=%d preext=%d", i+2, t2i, use_preext2_8);
+            applog(LOG_DEBUG, "DBG 8way second-pass map: i=%d t=%d preext=%d", i+3, t3, use_preext2_8);
+        }
+        AVX2_ROUND2(A,B,C,D,E,F,G,H, W2v[t0], K8[i+0]);
+        AVX2_ROUND2(A,B,C,D,E,F,G,H, W2v[t1i], K8[i+1]);
+        AVX2_ROUND2(A,B,C,D,E,F,G,H, W2v[t2i], K8[i+2]);
+        AVX2_ROUND2(A,B,C,D,E,F,G,H, W2v[t3], K8[i+3]);
+    }
+    #undef AVX2_ROUND2
+    A=_mm256_add_epi32(A,_mm256_set1_epi32((int)sha256_h[0]));
+    B=_mm256_add_epi32(B,_mm256_set1_epi32((int)sha256_h[1]));
+    C=_mm256_add_epi32(C,_mm256_set1_epi32((int)sha256_h[2]));
+    D=_mm256_add_epi32(D,_mm256_set1_epi32((int)sha256_h[3]));
+    E=_mm256_add_epi32(E,_mm256_set1_epi32((int)sha256_h[4]));
+    F=_mm256_add_epi32(F,_mm256_set1_epi32((int)sha256_h[5]));
+    G=_mm256_add_epi32(G,_mm256_set1_epi32((int)sha256_h[6]));
+    H=_mm256_add_epi32(H,_mm256_set1_epi32((int)sha256_h[7]));
+    uint32_t v8[8];
+    _mm256_storeu_si256((__m256i*)v8, A); for (int lane=0; lane<8; lane++) hash[0*8+lane]=v8[lane];
+    _mm256_storeu_si256((__m256i*)v8, B); for (int lane=0; lane<8; lane++) hash[1*8+lane]=v8[lane];
+    _mm256_storeu_si256((__m256i*)v8, C); for (int lane=0; lane<8; lane++) hash[2*8+lane]=v8[lane];
+    _mm256_storeu_si256((__m256i*)v8, D); for (int lane=0; lane<8; lane++) hash[3*8+lane]=v8[lane];
+    _mm256_storeu_si256((__m256i*)v8, E); for (int lane=0; lane<8; lane++) hash[4*8+lane]=v8[lane];
+    _mm256_storeu_si256((__m256i*)v8, F); for (int lane=0; lane<8; lane++) hash[5*8+lane]=v8[lane];
+    _mm256_storeu_si256((__m256i*)v8, G); for (int lane=0; lane<8; lane++) hash[6*8+lane]=v8[lane];
+    _mm256_storeu_si256((__m256i*)v8, H); for (int lane=0; lane<8; lane++) hash[7*8+lane]=v8[lane];
+}
+#endif
+
 static inline int scanhash_sha256d_8way(int thr_id, uint32_t *pdata,
     const uint32_t *ptarget, uint32_t max_nonce, unsigned long *hashes_done)
 {
@@ -845,41 +1177,51 @@ static inline int scanhash_sha256d_8way(int thr_id, uint32_t *pdata,
     int i, j;
 
     uint32_t block2[16];
-    cpunet_build_block2(block2, pdata);
-
-    memcpy(data, block2, 64);
-    sha256d_preextend(data);
-    for (i = 31; i >= 0; i--)
+    /* Build big-endian view of header words for midstate and block2 */
+    uint32_t pdata_be[20];
+    for (i = 0; i < 20; ++i) pdata_be[i] = swab32(pdata[i]);
+    cpunet_build_block2(block2, pdata_be);
+    for (i = 0; i < 16; i++)
         for (j = 0; j < 8; j++)
-            data[i * 8 + j] = data[i];
+            data[i * 8 + j] = block2[i];
 
-    sha256_init(midstate);
-    sha256_transform(midstate, pdata, 0);
-    memcpy(prehash, midstate, 32);
-    sha256d_prehash(prehash, block2);
-    for (i = 7; i >= 0; i--) {
+    uint32_t temp_midstate[8], temp_prehash[8];
+    sha256_init(temp_midstate);
+    /* Use big-endian word view for SHA256 midstate */
+    sha256_transform(temp_midstate, pdata_be, 0);
+    memcpy(temp_prehash, temp_midstate, 32);
+    sha256d_prehash(temp_prehash, block2);
+    for (i = 0; i < 8; i++) {
         for (j = 0; j < 8; j++) {
-            midstate[i * 8 + j] = midstate[i];
-            prehash[i * 8 + j] = prehash[i];
+            midstate[i * 8 + j] = temp_midstate[i];
+            prehash[i * 8 + j] = temp_prehash[i];
         }
     }
+    /* Also single-lane copies for self-check branch */
+    uint32_t midstate_one8[8], prehash_one8[8];
+    memcpy(midstate_one8, temp_midstate, 32);
+    memcpy(prehash_one8, temp_prehash, 32);
 
     do {
         for (i = 0; i < 8; i++)
-            data[8 * 3 + i] = ++n;
+            data[8 * 3 + i] = swab32(++n);
 
-        sha256d_ms_8way(hash, data, midstate, prehash);
+        /* Use 8-way SIMD kernel when available, else fallback C */
+        if (sha256_use_8way())
+            sha256d_ms_8way_simd(hash, data, midstate, prehash);
+        else
+            sha256d_ms_8way_c(hash, data, midstate, prehash);
 
         /* Debug: bypass precheck by fulltest on all lanes when enabled */
         if (opt_debug_lax_target || opt_debug_sample_canonical) {
             for (i = 0; i < 8; i++) {
-                uint32_t lane_nonce = data[8 * 3 + i];
-                if (lane_nonce > max_nonce)
+                uint32_t ln = swab32(data[8 * 3 + i]);
+                if (ln > max_nonce)
                     continue; /* respect bound during self-check and tests */
                 uint32_t canon[8];
-                for (int j2 = 0; j2 < 8; j2++) canon[j2] = swab32(hash[8 * i + j2]);
+                for (int j2 = 0; j2 < 8; j2++) canon[j2] = swab32(hash[8 * j2 + i]);
                 if (fulltest(canon, ptarget)) {
-                    pdata[19] = lane_nonce;
+                    pdata[19] = ln;
                     *hashes_done = n - first_nonce + 1;
                     return 1;
                 }
@@ -892,11 +1234,11 @@ static inline int scanhash_sha256d_8way(int thr_id, uint32_t *pdata,
             if (words_leq_256(&hash[8 * i], &hash[8 * best_lane]))
                 best_lane = i;
         }
-        miner_report_candidate(thr_id, pdata, data[8 * 3 + best_lane], swab32(hash[8 * 7 + best_lane]));
+        miner_report_candidate(thr_id, pdata, swab32(data[8 * 3 + best_lane]), swab32(hash[8 * 7 + best_lane]));
 
         for (i = 0; i < 8; i++) {
-            uint32_t lane_nonce = data[8 * 3 + i];
-            if (lane_nonce > max_nonce)
+            uint32_t ln = swab32(data[8 * 3 + i]);
+            if (ln > max_nonce)
                 continue; /* do not accept lanes beyond max_nonce */
             if (swab32(hash[8 * 7 + i]) <= Htarg) {
                 if (opt_debug) {
@@ -905,15 +1247,15 @@ static inline int scanhash_sha256d_8way(int thr_id, uint32_t *pdata,
                     printf("Target Htarg:        %08x\n", Htarg);
                 }
 
-                pdata[19] = lane_nonce;
+                pdata[19] = ln;
                 if (opt_debug) {
-                    if (cpunet_validate_and_print(i, pdata, lane_nonce, ptarget)) {
+                    if (cpunet_validate_and_print(i, pdata, ln, ptarget)) {
                         *hashes_done = n - first_nonce + 1;
                         return 1;
                     }
                 } else {
                     uint32_t canon2[8];
-                    for (int j3 = 0; j3 < 8; j3++) canon2[j3] = swab32(hash[8 * i + j3]);
+                    for (int j3 = 0; j3 < 8; j3++) canon2[j3] = swab32(hash[8 * j3 + i]);
                     if (fulltest(canon2, ptarget)) {
                         *hashes_done = n - first_nonce + 1;
                         return 1;
@@ -930,15 +1272,17 @@ static inline int scanhash_sha256d_8way(int thr_id, uint32_t *pdata,
 
 #endif /* HAVE_SHA256_8WAY */
 
-#if defined(__x86_64__) && defined(USE_ASM)
-/* AVX-512 helpers */
+#if defined(__x86_64__)
+/* AVX-512 helpers (intrinsics; independent of external assembly files) */
 #if defined(__GNUC__)
 __attribute__((target("avx512f")))
 #endif
 static inline __m512i avx512_pack512(const uint32_t *lo, const uint32_t *hi)
 {
-    __m256i lo256 = _mm256_loadu_si256((const __m256i *)lo);
-    __m256i hi256 = _mm256_loadu_si256((const __m256i *)hi);
+    const __m256i *lo_al = (const __m256i *) __builtin_assume_aligned(lo, 32);
+    const __m256i *hi_al = (const __m256i *) __builtin_assume_aligned(hi, 32);
+    __m256i lo256 = _mm256_load_si256(lo_al);
+    __m256i hi256 = _mm256_load_si256(hi_al);
     __m512i v = _mm512_castsi256_si512(lo256);
     return _mm512_inserti64x4(v, hi256, 1);
 }
@@ -993,36 +1337,50 @@ static void sha256d_ms_16way_avx512(uint32_t *hA, uint32_t *hB,
     const uint32_t *mA, const uint32_t *pA,
     const uint32_t *mB, const uint32_t *pB)
 {
-    (void)mA; (void)mB; /* midstate not needed directly; prehash contains starting state */
-    __m512i W[64];
+    /* Pre-broadcast K constants */
+    static __m512i K16[64];
+    static int K16_init = 0;
+    if (!K16_init) { for (int i=0;i<64;i++) K16[i]=_mm512_set1_epi32((int)sha256_k[i]); K16_init=1; }
+    /* Use midstate as initial A..H and run full 64 rounds on block2 with rolling W */
+    __m512i W[16];
     for (int i = 0; i < 16; i++)
         W[i] = avx512_pack512(dA + 8*i, dB + 8*i);
-    for (int i = 16; i < 64; i++)
-        W[i] = _mm512_add_epi32(_mm512_add_epi32(avx512_s1(W[i-2]), W[i-7]),
-                                 _mm512_add_epi32(avx512_s0(W[i-15]), W[i-16]));
-
-    __m512i A = avx512_pack512(pA + 8*0, pB + 8*0);
-    __m512i B = avx512_pack512(pA + 8*1, pB + 8*1);
-    __m512i C = avx512_pack512(pA + 8*2, pB + 8*2);
-    __m512i D = avx512_pack512(pA + 8*3, pB + 8*3);
-    __m512i E = avx512_pack512(pA + 8*4, pB + 8*4);
-    __m512i F = avx512_pack512(pA + 8*5, pB + 8*5);
-    __m512i G = avx512_pack512(pA + 8*6, pB + 8*6);
-    __m512i H = avx512_pack512(pA + 8*7, pB + 8*7);
-    /* Save initial prehash state for the feed-forward add after finishing rounds */
+    __m512i A = avx512_pack512(mA + 8*0, mB + 8*0);
+    __m512i B = avx512_pack512(mA + 8*1, mB + 8*1);
+    __m512i C = avx512_pack512(mA + 8*2, mB + 8*2);
+    __m512i D = avx512_pack512(mA + 8*3, mB + 8*3);
+    __m512i E = avx512_pack512(mA + 8*4, mB + 8*4);
+    __m512i F = avx512_pack512(mA + 8*5, mB + 8*5);
+    __m512i G = avx512_pack512(mA + 8*6, mB + 8*6);
+    __m512i H = avx512_pack512(mA + 8*7, mB + 8*7);
     __m512i SA = A, SB = B, SC = C, SD = D, SE = E, SF = F, SG = G, SH = H;
+    #if defined(__GNUC__)
+    #pragma GCC unroll 8
+    #endif
+    #define AVX512_ROUND(AA,BB,CC,DD,EE,FF,GG,HH, WT, KI) do { \
+        __m512i t1 = _mm512_add_epi32((HH), _mm512_add_epi32(avx512_S1(EE), \
+            _mm512_add_epi32(_mm512_xor_si512(_mm512_and_si512((EE),(FF)), _mm512_andnot_si512((EE),(GG))), \
+                              _mm512_add_epi32((WT), (KI))))); \
+        __m512i t2 = _mm512_add_epi32(avx512_S0(AA), _mm512_xor_si512(_mm512_xor_si512(_mm512_and_si512((AA),(BB)), _mm512_and_si512((AA),(CC))), _mm512_and_si512((BB),(CC)))); \
+        (DD) = _mm512_add_epi32((DD), t1); \
+        (HH) = _mm512_add_epi32(t1, t2); \
+        __m512i tmp_ = (HH); (HH)=(GG); (GG)=(FF); (FF)=(EE); (EE)=(DD); (DD)=(CC); (CC)=(BB); (BB)=(AA); (AA)=tmp_; \
+    } while(0)
 
-    /* Continue from round 3 since prehash already applied rounds 0..2 */
-    for (int i = 3; i < 64; i++) {
-        __m512i K = _mm512_set1_epi32((int)sha256_k[i]);
-        __m512i t1 = _mm512_add_epi32(H, _mm512_add_epi32(avx512_S1(E),
-            _mm512_add_epi32(_mm512_xor_si512(_mm512_and_si512(E,F), _mm512_andnot_si512(E,G)),
-                              _mm512_add_epi32(W[i], K))));
-        __m512i t2 = _mm512_add_epi32(avx512_S0(A), _mm512_xor_si512(_mm512_xor_si512(_mm512_and_si512(A,B), _mm512_and_si512(A,C)), _mm512_and_si512(B,C)));
-        D = _mm512_add_epi32(D, t1);
-        H = _mm512_add_epi32(t1, t2);
-        __m512i tmp = H; H = G; G = F; F = E; E = D; D = C; C = B; B = A; A = tmp;
+    for (int i = 0; i < 64; i+=4) {
+        int t0=(i+0)&15, t1i=(i+1)&15, t2i=(i+2)&15, t3=(i+3)&15;
+        if (i >= 16) {
+            W[t0] = _mm512_add_epi32(_mm512_add_epi32(avx512_s1(W[(t0+14)&15]), W[(t0+9)&15]), _mm512_add_epi32(avx512_s0(W[(t0+1)&15]), W[t0]));
+            W[t1i] = _mm512_add_epi32(_mm512_add_epi32(avx512_s1(W[(t1i+14)&15]), W[(t1i+9)&15]), _mm512_add_epi32(avx512_s0(W[(t1i+1)&15]), W[t1i]));
+            W[t2i] = _mm512_add_epi32(_mm512_add_epi32(avx512_s1(W[(t2i+14)&15]), W[(t2i+9)&15]), _mm512_add_epi32(avx512_s0(W[(t2i+1)&15]), W[t2i]));
+            W[t3] = _mm512_add_epi32(_mm512_add_epi32(avx512_s1(W[(t3+14)&15]), W[(t3+9)&15]), _mm512_add_epi32(avx512_s0(W[(t3+1)&15]), W[t3]));
+        }
+        AVX512_ROUND(A,B,C,D,E,F,G,H, W[t0], K16[i+0]);
+        AVX512_ROUND(A,B,C,D,E,F,G,H, W[t1i], K16[i+1]);
+        AVX512_ROUND(A,B,C,D,E,F,G,H, W[t2i], K16[i+2]);
+        AVX512_ROUND(A,B,C,D,E,F,G,H, W[t3], K16[i+3]);
     }
+    #undef AVX512_ROUND
     /* Feed-forward: add starting prehash state to produce first-pass digest words */
     A = _mm512_add_epi32(A, SA);
     B = _mm512_add_epi32(B, SB);
@@ -1034,13 +1392,12 @@ static void sha256d_ms_16way_avx512(uint32_t *hA, uint32_t *hB,
     H = _mm512_add_epi32(H, SH);
 
     __m512i stA = A, stBv = B, stCv = C, stDv = D, stEv = E, stFv = F, stGv = G, stHv = H;
-    __m512i W2[64];
+    __m512i W2[16];
+    static __m512i P2_17_16, P2_23_16, P2_24_16, P2_30_16; static int P2_16_init=0; static int use_preext2_16=1;
+    if (!P2_16_init) { P2_17_16=_mm512_set1_epi32(0x00a00000); P2_23_16=_mm512_set1_epi32(0x11002000); P2_24_16=_mm512_set1_epi32(0x80000000); P2_30_16=_mm512_set1_epi32(0x00400022); P2_16_init=1; }
     W2[0] = stA; W2[1] = stBv; W2[2] = stCv; W2[3] = stDv;
     W2[4] = stEv; W2[5] = stFv; W2[6] = stGv; W2[7] = stHv;
     for (int i = 8; i < 16; i++) W2[i] = _mm512_set1_epi32((int)sha256d_hash1[i]);
-    for (int i = 16; i < 64; i++)
-        W2[i] = _mm512_add_epi32(_mm512_add_epi32(avx512_s1(W2[i-2]), W2[i-7]),
-                                  _mm512_add_epi32(avx512_s0(W2[i-15]), W2[i-16]));
 
     A = _mm512_set1_epi32((int)sha256_h[0]);
     B = _mm512_set1_epi32((int)sha256_h[1]);
@@ -1050,16 +1407,33 @@ static void sha256d_ms_16way_avx512(uint32_t *hA, uint32_t *hB,
     F = _mm512_set1_epi32((int)sha256_h[5]);
     G = _mm512_set1_epi32((int)sha256_h[6]);
     H = _mm512_set1_epi32((int)sha256_h[7]);
-    for (int i = 0; i < 64; i++) {
-        __m512i K = _mm512_set1_epi32((int)sha256_k[i]);
-        __m512i t1 = _mm512_add_epi32(H, _mm512_add_epi32(avx512_S1(E),
-            _mm512_add_epi32(_mm512_xor_si512(_mm512_and_si512(E,F), _mm512_andnot_si512(E,G)),
-                              _mm512_add_epi32(W2[i], K))));
-        __m512i t2 = _mm512_add_epi32(avx512_S0(A), _mm512_xor_si512(_mm512_xor_si512(_mm512_and_si512(A,B), _mm512_and_si512(A,C)), _mm512_and_si512(B,C)));
-        D = _mm512_add_epi32(D, t1);
-        H = _mm512_add_epi32(t1, t2);
-        __m512i tmp = H; H = G; G = F; F = E; E = D; D = C; C = B; B = A; A = tmp;
+    #if defined(__GNUC__)
+    #pragma GCC unroll 8
+    #endif
+    #define AVX512_ROUND2(AA,BB,CC,DD,EE,FF,GG,HH, WT, KI) do { \
+        __m512i t1 = _mm512_add_epi32((HH), _mm512_add_epi32(avx512_S1(EE), \
+            _mm512_add_epi32(_mm512_xor_si512(_mm512_and_si512((EE),(FF)), _mm512_andnot_si512((EE),(GG))), \
+                              _mm512_add_epi32((WT), (KI))))); \
+        __m512i t2 = _mm512_add_epi32(avx512_S0(AA), _mm512_xor_si512(_mm512_xor_si512(_mm512_and_si512((AA),(BB)), _mm512_and_si512((AA),(CC))), _mm512_and_si512((BB),(CC)))); \
+        (DD) = _mm512_add_epi32((DD), t1); \
+        (HH) = _mm512_add_epi32(t1, t2); \
+        __m512i tmp_ = (HH); (HH)=(GG); (GG)=(FF); (FF)=(EE); (EE)=(DD); (DD)=(CC); (CC)=(BB); (BB)=(AA); (AA)=tmp_; \
+    } while(0)
+
+    for (int i = 0; i < 64; i+=4) {
+        int t0=(i+0)&15, t1i=(i+1)&15, t2i=(i+2)&15, t3=(i+3)&15;
+        if (i >= 16) {
+            W2[t0] = _mm512_add_epi32(_mm512_add_epi32(avx512_s1(W2[(t0+14)&15]), W2[(t0+9)&15]), _mm512_add_epi32(avx512_s0(W2[(t0+1)&15]), W2[t0])); if (use_preext2_16 && i+0==17) W2[t0]=_mm512_add_epi32(W2[t0], P2_17_16);
+            W2[t1i] = _mm512_add_epi32(_mm512_add_epi32(avx512_s1(W2[(t1i+14)&15]), W2[(t1i+9)&15]), _mm512_add_epi32(avx512_s0(W2[(t1i+1)&15]), W2[t1i])); if (use_preext2_16 && i+1==23) W2[t1i]=_mm512_add_epi32(W2[t1i], P2_23_16);
+            W2[t2i] = _mm512_add_epi32(_mm512_add_epi32(avx512_s1(W2[(t2i+14)&15]), W2[(t2i+9)&15]), _mm512_add_epi32(avx512_s0(W2[(t2i+1)&15]), W2[t2i])); if (use_preext2_16 && i+2==24) W2[t2i]=_mm512_add_epi32(W2[t2i], P2_24_16);
+            W2[t3] = _mm512_add_epi32(_mm512_add_epi32(avx512_s1(W2[(t3+14)&15]), W2[(t3+9)&15]), _mm512_add_epi32(avx512_s0(W2[(t3+1)&15]), W2[t3])); if (use_preext2_16 && i+3==30) W2[t3]=_mm512_add_epi32(W2[t3], P2_30_16);
+        }
+        AVX512_ROUND2(A,B,C,D,E,F,G,H, W2[t0], K16[i+0]);
+        AVX512_ROUND2(A,B,C,D,E,F,G,H, W2[t1i], K16[i+1]);
+        AVX512_ROUND2(A,B,C,D,E,F,G,H, W2[t2i], K16[i+2]);
+        AVX512_ROUND2(A,B,C,D,E,F,G,H, W2[t3], K16[i+3]);
     }
+    #undef AVX512_ROUND2
     A = _mm512_add_epi32(A, _mm512_set1_epi32((int)sha256_h[0]));
     B = _mm512_add_epi32(B, _mm512_set1_epi32((int)sha256_h[1]));
     C = _mm512_add_epi32(C, _mm512_set1_epi32((int)sha256_h[2]));
@@ -1115,18 +1489,20 @@ static inline int scanhash_sha256d_16way(int thr_id, uint32_t *pdata,
     int i, j;
 
     uint32_t block2[16];
-    cpunet_build_block2(block2, pdata);
+    /* Build big-endian view of header words for midstate and block2 */
+    uint32_t pdata_be[20];
+    for (i = 0; i < 20; ++i) pdata_be[i] = swab32(pdata[i]);
+    cpunet_build_block2(block2, pdata_be);
 
-    memcpy(dataA, block2, 64);
-    sha256d_preextend(dataA);
-    for (i = 31; i >= 0; i--)
+    for (i = 0; i < 16; i++)
         for (j = 0; j < 8; j++)
-            dataA[i * 8 + j] = dataA[i];
+            dataA[i * 8 + j] = block2[i];
     memcpy(dataB, dataA, sizeof(dataA));
 
     uint32_t midstate[8];
     sha256_init(midstate);
-    sha256_transform(midstate, pdata, 0);
+    /* Use big-endian word view for SHA256 midstate */
+    sha256_transform(midstate, pdata_be, 0);
     memcpy(preA, midstate, 32);
     sha256d_prehash(preA, block2);
     for (i = 7; i >= 0; i--) {
@@ -1139,32 +1515,31 @@ static inline int scanhash_sha256d_16way(int thr_id, uint32_t *pdata,
     memcpy(preB, preA, sizeof(preA));
 
     do {
-        for (i = 0; i < 8; i++) dataA[8 * 3 + i] = ++n;
-        for (i = 0; i < 8; i++) dataB[8 * 3 + i] = ++n;
+        /* normal AVX-512 path */
+        for (i = 0; i < 8; i++) dataA[8 * 3 + i] = swab32(++n);
+        for (i = 0; i < 8; i++) dataB[8 * 3 + i] = swab32(++n);
 
         sha256d_ms_16way_avx512(hashA, hashB, dataA, dataB, midA, preA, midB, preB);
 
         /* Report only the best lane for diagnostics to reduce overhead. */
-        if (opt_debug) {
-            int best_lane = 0; uint32_t best_val = 0xffffffffU;
-            for (i = 0; i < 8; i++) {
-                uint32_t v = swab32(hashA[8 * 7 + i]);
-                if (v < best_val) { best_val = v; best_lane = i; }
-            }
-            for (i = 0; i < 8; i++) {
-                uint32_t v = swab32(hashB[8 * 7 + i]);
-                if (v < best_val) { best_val = v; best_lane = 8 + i; }
-            }
-            uint32_t best_nonce = (best_lane < 8) ? dataA[8 * 3 + best_lane] : dataB[8 * 3 + (best_lane - 8)];
-            miner_report_candidate(thr_id, pdata, best_nonce, best_val);
+        int best_lane = 0; uint32_t best_val = 0xffffffffU;
+        for (i = 0; i < 8; i++) {
+            uint32_t v = swab32(hashA[8 * 7 + i]);
+            if (v < best_val) { best_val = v; best_lane = i; }
         }
+        for (i = 0; i < 8; i++) {
+            uint32_t v = swab32(hashB[8 * 7 + i]);
+            if (v < best_val) { best_val = v; best_lane = 8 + i; }
+        }
+        uint32_t best_nonce = (best_lane < 8) ? swab32(dataA[8 * 3 + best_lane]) : swab32(dataB[8 * 3 + (best_lane - 8)]);
+        miner_report_candidate(thr_id, pdata, best_nonce, best_val);
 
         for (i = 0; i < 8; i++) {
-            uint32_t lane_nonce = dataA[8 * 3 + i];
+            uint32_t lane_nonce = swab32(dataA[8 * 3 + i]);
             if (lane_nonce <= max_nonce && swab32(hashA[8 * 7 + i]) <= Htarg) {
                 pdata[19] = lane_nonce;
                 uint32_t canon2[8];
-                for (int j3 = 0; j3 < 8; j3++) canon2[j3] = swab32(hashA[8 * i + j3]);
+                for (int j3 = 0; j3 < 8; j3++) canon2[j3] = swab32(hashA[8 * j3 + i]);
                 if (fulltest(canon2, ptarget)) {
                     *hashes_done = n - first_nonce + 1;
                     return 1;
@@ -1172,11 +1547,11 @@ static inline int scanhash_sha256d_16way(int thr_id, uint32_t *pdata,
             }
         }
         for (i = 0; i < 8; i++) {
-            uint32_t lane_nonce = dataB[8 * 3 + i];
+            uint32_t lane_nonce = swab32(dataB[8 * 3 + i]);
             if (lane_nonce <= max_nonce && swab32(hashB[8 * 7 + i]) <= Htarg) {
                 pdata[19] = lane_nonce;
                 uint32_t canon2[8];
-                for (int j3 = 0; j3 < 8; j3++) canon2[j3] = swab32(hashB[8 * i + j3]);
+                for (int j3 = 0; j3 < 8; j3++) canon2[j3] = swab32(hashB[8 * j3 + i]);
                 if (fulltest(canon2, ptarget)) {
                     *hashes_done = n - first_nonce + 1;
                     return 1;
@@ -1189,10 +1564,184 @@ static inline int scanhash_sha256d_16way(int thr_id, uint32_t *pdata,
     pdata[19] = n;
     return 0;
 }
-#endif /* __x86_64__ && USE_ASM */
+#endif /* __x86_64__ */
 
 static int g_printed_sha_path = 0;
 extern volatile int g_backend_force; /* defined below */
+
+/* Feature detection helpers */
+#if defined(__x86_64__)
+
+static inline int cpu_has_avx_os(void) {
+    unsigned int eax, ebx, ecx, edx;
+    eax = 1; __asm__ __volatile__("cpuid":"=a"(eax),"=b"(ebx),"=c"(ecx),"=d"(edx):"a"(eax));
+    if (!(ecx & (1u<<27))) return 0; /* OSXSAVE */
+    unsigned int xcr0_lo=0,xcr0_hi=0; __asm__ __volatile__("xgetbv":"=a"(xcr0_lo),"=d"(xcr0_hi):"c"(0));
+    return ((xcr0_lo & 0x6) == 0x6); /* XMM|YMM */
+}
+
+static inline int cpu_has_avx(void) {
+    unsigned int eax, ebx, ecx, edx; eax=1; __asm__ __volatile__("cpuid":"=a"(eax),"=b"(ebx),"=c"(ecx),"=d"(edx):"a"(eax));
+    return cpu_has_avx_os() && (ecx & (1u<<28));
+}
+
+static inline int cpu_has_avx2(void) {
+    unsigned int eax, ebx, ecx, edx; eax=7; ecx=0; __asm__ __volatile__("cpuid":"=a"(eax),"=b"(ebx),"=c"(ecx),"=d"(edx):"a"(eax),"c"(ecx));
+    return cpu_has_avx_os() && (ebx & (1u<<5));
+}
+
+static inline int cpu_has_avx512(void)
+{
+    unsigned int eax, ebx, ecx, edx;
+    /* AVX-512F check */
+    eax = 7; ecx = 0;
+    __asm__ __volatile__("cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(eax), "c"(ecx));
+    int has_avx512f = (ebx & (1u << 16)) != 0;
+    if (!has_avx512f) return 0;
+    /* XGETBV: require Opmask, ZMM_hi256, Hi16_ZMM plus AVX state */
+    unsigned int xcr0_lo = 0, xcr0_hi = 0;
+    __asm__ __volatile__("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
+    unsigned int need = (1u << 1) | (1u << 2) | (1u << 5) | (1u << 6);
+    return ((xcr0_lo & need) == need);
+}
+
+#if defined(USE_ASM)
+static inline int cpu_has_phe(void)
+{
+    unsigned int eax, ebx, ecx, edx;
+    /* Check for extended CPUID level */
+    eax = 0xC0000000u;
+    __asm__ __volatile__(
+        "cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(eax), "c"(0)
+    );
+    if (eax < 0xC0000001u)
+        return 0;
+    /* Query VIA PadLock features */
+    eax = 0xC0000001u;
+    __asm__ __volatile__(
+        "cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(eax), "c"(0)
+    );
+    /* Bits 10 and 11 (0x00000C00) indicate SHA (PHE) availability */
+    return (edx & 0x00000C00u) == 0x00000C00u;
+}
+
+static inline int cpu_has_shani(void)
+{
+    unsigned int eax, ebx, ecx, edx;
+    /* CPUID leaf 7, subleaf 0: EBX bit 29 = SHA */
+    eax = 7; ecx = 0;
+    __asm__ __volatile__("cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(eax), "c"(ecx));
+    return (ebx & (1u << 29)) != 0;
+}
+#endif /* USE_ASM */
+
+#else /* !__x86_64__ */
+
+static inline int cpu_has_avx(void) { return 0; }
+static inline int cpu_has_avx2(void) { return 0; }
+static inline int cpu_has_avx512(void) { return 0; }
+#if defined(USE_ASM)
+static inline int cpu_has_phe(void) { return 0; }
+static inline int cpu_has_shani(void) { return 0; }
+#endif /* USE_ASM */
+
+#endif /* __x86_64__ */
+
+/* Dispatcher for sha256d_ms. */
+#if defined(__x86_64__) && defined(USE_ASM)
+static int g_printed_sha256d_ms_path = 0;
+void sha256d_ms(uint32_t *hash, uint32_t *W,
+    const uint32_t *midstate, const uint32_t *prehash)
+{
+    if (cpu_has_phe()) {
+        if (__sync_bool_compare_and_swap(&g_printed_sha256d_ms_path, 0, 1))
+            applog(LOG_INFO, "sha256d_ms path: padlock-phe");
+        sha256d_ms_phe(hash, W, midstate, prehash);
+    } else if (cpu_has_shani()) {
+        if (__sync_bool_compare_and_swap(&g_printed_sha256d_ms_path, 0, 1))
+            applog(LOG_INFO, "sha256d_ms path: sha-ni");
+        sha256d_ms_shani(hash, W, midstate, prehash);
+    } else {
+        if (__sync_bool_compare_and_swap(&g_printed_sha256d_ms_path, 0, 1))
+            applog(LOG_INFO, "sha256d_ms path: scalar-c");
+        sha256d_ms_c(hash, W, midstate, prehash);
+    }
+}
+#else
+/* Non-x86_64 or no ASM: always use the portable C path. */
+void sha256d_ms(uint32_t *hash, uint32_t *W,
+    const uint32_t *midstate, const uint32_t *prehash)
+{
+    sha256d_ms_c(hash, W, midstate, prehash);
+}
+#endif
+
+#ifndef USE_ASM
+int sha256_use_4way(void) {
+#if defined(__x86_64__)
+    /* SSE2 baseline on x86_64; AVX boosts throughput if available */
+    (void)cpu_has_avx();
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int sha256_use_8way(void) {
+    return cpu_has_avx2();
+}
+#endif
+
+#ifndef USE_ASM
+/* Portable 4-way/8-way init/transform used by scrypt and generic code when assembly is disabled. */
+void sha256_init_4way(uint32_t *state)
+{
+    for (int i = 0; i < 8; i++) {
+        for (int lane = 0; lane < 4; lane++)
+            state[i * 4 + lane] = sha256_h[i];
+    }
+}
+
+void sha256_transform_4way(uint32_t *state, const uint32_t *block, int swap)
+{
+    for (int lane = 0; lane < 4; lane++) {
+        uint32_t st[8];
+        uint32_t blk[16];
+        for (int i = 0; i < 8; i++) st[i] = state[i * 4 + lane];
+        for (int i = 0; i < 16; i++) blk[i] = block[i * 4 + lane];
+        sha256_transform(st, blk, 0);
+        for (int i = 0; i < 8; i++) state[i * 4 + lane] = st[i];
+    }
+}
+
+void sha256_init_8way(uint32_t *state)
+{
+    for (int i = 0; i < 8; i++) {
+        for (int lane = 0; lane < 8; lane++)
+            state[i * 8 + lane] = sha256_h[i];
+    }
+}
+
+void sha256_transform_8way(uint32_t *state, const uint32_t *block, int swap)
+{
+    for (int lane = 0; lane < 8; lane++) {
+        uint32_t st[8];
+        uint32_t blk[16];
+        for (int i = 0; i < 8; i++) st[i] = state[i * 8 + lane];
+        for (int i = 0; i < 16; i++) blk[i] = block[i * 8 + lane];
+        sha256_transform(st, blk, 0);
+        for (int i = 0; i < 8; i++) state[i * 8 + lane] = st[i];
+    }
+}
+#endif
 int scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
     uint32_t max_nonce, unsigned long *hashes_done)
 {
@@ -1204,19 +1753,20 @@ int scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
     const uint32_t first_nonce = pdata[19];
     const uint32_t Htarg = ptarget[7];
 
+#if defined(__x86_64__)
+    /* Prefer 16-way AVX-512 when available in auto mode, or when forced */
+    if (g_backend_force == 4 || (g_backend_force == 0 && cpu_has_avx512())) {
+        if (__sync_bool_compare_and_swap(&g_printed_sha_path, 0, 1))
+            applog(LOG_INFO, "Using 16-way AVX-512 SHA256 path");
+        return scanhash_sha256d_16way(thr_id, pdata, ptarget, max_nonce, hashes_done);
+    }
+#endif
 #ifdef HAVE_SHA256_8WAY
     if (g_backend_force == 3 || (g_backend_force == 0 && sha256_use_8way())) {
         if (__sync_bool_compare_and_swap(&g_printed_sha_path, 0, 1))
             applog(LOG_INFO, "Using 8-way AVX2 SHA256 path");
         return scanhash_sha256d_8way(thr_id, pdata, ptarget,
             max_nonce, hashes_done);
-    }
-#endif
-#if defined(__x86_64__) && defined(USE_ASM)
-    if (g_backend_force == 4) {
-        if (__sync_bool_compare_and_swap(&g_printed_sha_path, 0, 1))
-            applog(LOG_INFO, "Using 16-way AVX-512 SHA256 path");
-        return scanhash_sha256d_16way(thr_id, pdata, ptarget, max_nonce, hashes_done);
     }
 #endif
 #ifdef HAVE_SHA256_4WAY
@@ -1231,13 +1781,16 @@ int scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
         applog(LOG_INFO, "Using scalar SHA256 path (ASM/C/PHE auto)");
 
     uint32_t block2[16];
-    cpunet_build_block2(block2, pdata);
+    /* Build big-endian view of header words for midstate and block2 */
+    uint32_t pdata_be_all[20];
+    for (int k = 0; k < 20; ++k) pdata_be_all[k] = swab32(pdata[k]);
+    cpunet_build_block2(block2, pdata_be_all);
 
     memcpy(data, block2, 64);
     sha256d_preextend(data);
 
     sha256_init(midstate);
-    sha256_transform(midstate, pdata, 0);
+    sha256_transform(midstate, pdata_be_all, 0);
     memcpy(prehash, midstate, 32);
     sha256d_prehash(prehash, block2);
 
@@ -1380,6 +1933,9 @@ int cpunet_selfcheck(void)
         for (int i = 0; i < 32; i++) digest_internal_rev[i] = digest_internal[31 - i];
         bin2hex(digest_internal_hex, digest_internal_rev, 32);
 
+        /* Optional debug: verify second-pass schedule preext mapping */
+        debug_verify_w2_preext(header20);
+
         /* Path B: fast midstate pipeline */
         uint32_t pdata_equiv[20];
         for (int i = 0; i < 20; i++)
@@ -1413,6 +1969,122 @@ int cpunet_selfcheck(void)
             return 0;
         }
         applog(LOG_INFO, "CPUNet genesis verified: %s", expect_hex);
+
+        /* Part 3: Re-mine genesis block with scanhash functions */
+        applog(LOG_INFO, "CPUNet self-check: re-mining genesis block...");
+        {
+            uint32_t scan_header[20];
+            uint32_t ptarget[8] = {0};
+            unsigned long hashes_done = 0;
+            const uint32_t start_nonce = 961340000;
+            const uint32_t max_nonce = 961350000;
+            int failures_remine = 0;
+
+            // Target from nbits 0x1d00ffff
+            ptarget[7] = 0x0000ffff;
+
+            // Explicitly test scalar path by forcing backend to scalar
+            {
+                extern volatile int g_backend_force;
+                int saved_backend = g_backend_force;
+                g_backend_force = 1; /* force scalar in scanhash wrapper */
+                applog(LOG_INFO, "  - Testing scalar...");
+                memcpy(scan_header, header20, 80);
+                scan_header[19] = start_nonce;
+                if (scanhash_sha256d(0, scan_header, ptarget, max_nonce, &hashes_done)) {
+                    if (scan_header[19] == nonce) {
+                        applog(LOG_INFO, "    scalar OK (found nonce %u)", scan_header[19]);
+                    } else {
+                        applog(LOG_ERR, "    scalar FAIL: found nonce %u, expected %u", scan_header[19], nonce);
+                        failures_remine++;
+                    }
+                } else {
+                    applog(LOG_ERR, "    scalar FAIL: did not find nonce in range");
+                    failures_remine++;
+                }
+                g_backend_force = saved_backend; /* restore */
+            }
+
+#ifdef HAVE_SHA256_4WAY
+            applog(LOG_INFO, "  - Testing 4-way...");
+            /* Initialize 4-way backend dispatch; skip if unsupported */
+            if (!sha256_use_4way()) {
+                applog(LOG_INFO, "    4-way not supported on this CPU; skipping");
+            } else {
+                memcpy(scan_header, header20, 80);
+                scan_header[19] = start_nonce;
+                if (scanhash_sha256d_4way(0, scan_header, ptarget, max_nonce, &hashes_done)) {
+                if (scan_header[19] == nonce) {
+                    applog(LOG_INFO, "    4-way OK (found nonce %u)", scan_header[19]);
+                } else {
+                    applog(LOG_ERR, "    4-way FAIL: found nonce %u, expected %u", scan_header[19], nonce);
+                    failures_remine++;
+                }
+                } else {
+                    applog(LOG_ERR, "    4-way FAIL: did not find nonce in range");
+                    failures_remine++;
+                }
+            }
+#endif
+#ifdef HAVE_SHA256_8WAY
+            applog(LOG_INFO, "  - Testing 8-way...");
+            /* Initialize 8-way backend dispatch; skip if unsupported */
+            if (!sha256_use_8way()) {
+                applog(LOG_INFO, "    8-way not supported on this CPU; skipping");
+            } else {
+                memcpy(scan_header, header20, 80);
+                scan_header[19] = start_nonce;
+                if (scanhash_sha256d_8way(0, scan_header, ptarget, max_nonce, &hashes_done)) {
+                if (scan_header[19] == nonce) {
+                    applog(LOG_INFO, "    8-way OK (found nonce %u)", scan_header[19]);
+                } else {
+                    applog(LOG_ERR, "    8-way FAIL: found nonce %u, expected %u", scan_header[19], nonce);
+                    failures_remine++;
+                }
+                } else {
+                    applog(LOG_ERR, "    8-way FAIL: did not find nonce in range");
+                    failures_remine++;
+                }
+            }
+#endif
+#if defined(__x86_64__)
+            if (cpu_has_avx512()) {
+                applog(LOG_INFO, "  - Testing 16-way...");
+                memcpy(scan_header, header20, 80);
+                scan_header[19] = start_nonce;
+                if (scanhash_sha256d_16way(0, scan_header, ptarget, max_nonce, &hashes_done)) {
+                    if (scan_header[19] == nonce) {
+                        applog(LOG_INFO, "    16-way OK (found nonce %u)", scan_header[19]);
+                    } else {
+                        applog(LOG_ERR, "    16-way FAIL: found nonce %u, expected %u", scan_header[19], nonce);
+                        failures_remine++;
+                    }
+                } else {
+                    applog(LOG_ERR, "    16-way FAIL: did not find nonce in range");
+                    failures_remine++;
+                }
+            }
+#endif
+            // Test the main wrapper
+            applog(LOG_INFO, "  - Testing scanhash_sha256d wrapper...");
+            memcpy(scan_header, header20, 80);
+            scan_header[19] = start_nonce;
+            if (scanhash_sha256d(0, scan_header, ptarget, max_nonce, &hashes_done)) {
+                if (scan_header[19] == nonce) {
+                    applog(LOG_INFO, "    scanhash_sha256d OK (found nonce %u)", scan_header[19]);
+                } else {
+                    applog(LOG_ERR, "    scanhash_sha256d FAIL: found nonce %u, expected %u", scan_header[19], nonce);
+                    failures_remine++;
+                }
+            } else {
+                applog(LOG_ERR, "    scanhash_sha256d FAIL: did not find nonce in range");
+                failures_remine++;
+            }
+
+            if (failures_remine > 0) {
+                failures++;
+            }
+        }
     }
 
     if (failures == 0) {
@@ -1517,9 +2189,12 @@ void benchmark_sha256d_all_impls(void)
 #ifdef __x86_64__
     TIME_IT("scalar-asm", (chunk = 0, scanhash_sha256d_scalar_asm(0, data, target, data[19] + 0x20000, &chunk)));
 #endif
+    /* SHA-NI scalar path only available with assembly enabled */
+#if defined(__x86_64__) && defined(USE_ASM)
     if (cpu_has_shani()) {
         TIME_IT("scalar-shani", (chunk = 0, scanhash_sha256d_scalar_shani(0, data, target, data[19] + 0x20000, &chunk)));
     }
+#endif
 #ifdef HAVE_SHA256_4WAY
     if (sha256_use_4way()) {
         TIME_IT("4way", (chunk = 0, scanhash_sha256d_4way(0, data, target, data[19] + 0x20000, &chunk)));
@@ -1530,7 +2205,7 @@ void benchmark_sha256d_all_impls(void)
         TIME_IT("8way", (chunk = 0, scanhash_sha256d_8way(0, data, target, data[19] + 0x20000, &chunk)));
     }
 #endif
-#if defined(__x86_64__) && defined(USE_ASM)
+#if defined(__x86_64__)
     if (cpu_has_avx512()) {
         TIME_IT("16way", (chunk = 0, scanhash_sha256d_16way(0, data, target, data[19] + 0x20000, &chunk)));
     }
@@ -1610,7 +2285,7 @@ void sha256_auto_select_backend(void)
     }
 #endif
 // Prefer checking AVX-512 16-way first if available
-#if defined(__x86_64__) && defined(USE_ASM)
+#if defined(__x86_64__)
     if (cpu_has_avx512()) {
         double s16 = measure_backend_khs("16way", scanhash_sha256d_16way, data, target);
         if (s16 > best_khs) { best_khs = s16; best = SHA_B_16WAY; }
@@ -1623,7 +2298,7 @@ void sha256_auto_select_backend(void)
     }
 #endif
     g_backend_force = best;
-    const char *name = best==SHA_B_8WAY?"8-way": best==SHA_B_4WAY?"4-way":"scalar";
+    const char *name = (best==SHA_B_16WAY?"16-way": best==SHA_B_8WAY?"8-way": best==SHA_B_4WAY?"4-way":"scalar");
     applog(LOG_INFO, "Auto-select: choosing %s backend", name);
 }
 
@@ -1653,15 +2328,17 @@ static inline int scanhash_sha256d_scalar_c(int thr_id, uint32_t *pdata,
     const uint32_t Htarg = ptarget[7];
 
     uint32_t block2[16];
-    cpunet_build_block2(block2, pdata);
+    uint32_t pdata_be_loc[20];
+    for (int k = 0; k < 20; ++k) pdata_be_loc[k] = swab32(pdata[k]);
+    cpunet_build_block2(block2, pdata_be_loc);
 
     memcpy(data, block2, 64);
     sha256d_preextend(data);
 
     sha256_init(midstate);
-    /* Use C reference compressor for midstate */
+    /* Use C reference compressor for midstate (big-endian word view) */
     uint32_t midcpy[8]; memcpy(midcpy, midstate, 32);
-    sha256_transform_ref(midcpy, pdata, 0);
+    sha256_transform_ref(midcpy, pdata_be_loc, 0);
     memcpy(midstate, midcpy, 32);
     memcpy(prehash, midstate, 32);
     sha256d_prehash(prehash, block2);
@@ -1698,13 +2375,15 @@ static inline int scanhash_sha256d_scalar_asm(int thr_id, uint32_t *pdata,
     const uint32_t Htarg = ptarget[7];
 
     uint32_t block2[16];
-    cpunet_build_block2(block2, pdata);
+    uint32_t pdata_be_loc[20];
+    for (int k = 0; k < 20; ++k) pdata_be_loc[k] = swab32(pdata[k]);
+    cpunet_build_block2(block2, pdata_be_loc);
 
     memcpy(data, block2, 64);
     sha256d_preextend(data);
 
     sha256_init(midstate);
-    sha256_transform(midstate, pdata, 0); /* assembly back-end */
+    sha256_transform(midstate, pdata_be_loc, 0); /* assembly back-end */
     memcpy(prehash, midstate, 32);
     sha256d_prehash(prehash, block2);
 
@@ -1741,13 +2420,15 @@ static inline int scanhash_sha256d_phe(int thr_id, uint32_t *pdata,
     const uint32_t Htarg = ptarget[7];
 
     uint32_t block2[16];
-    cpunet_build_block2(block2, pdata);
+    uint32_t pdata_be_loc[20];
+    for (int k = 0; k < 20; ++k) pdata_be_loc[k] = swab32(pdata[k]);
+    cpunet_build_block2(block2, pdata_be_loc);
 
     memcpy(data, block2, 64);
     sha256d_preextend(data);
 
     sha256_init(midstate);
-    sha256_transform(midstate, pdata, 0); /* base SSE2 for midstate */
+    sha256_transform(midstate, pdata_be_loc, 0); /* base SSE2 for midstate */
     memcpy(prehash, midstate, 32);
     sha256d_prehash(prehash, block2);
 
@@ -1787,13 +2468,15 @@ static inline int scanhash_sha256d_scalar_shani(int thr_id, uint32_t *pdata,
     const uint32_t Htarg = ptarget[7];
 
     uint32_t block2[16];
-    cpunet_build_block2(block2, pdata);
+    uint32_t pdata_be_loc[20];
+    for (int k = 0; k < 20; ++k) pdata_be_loc[k] = swab32(pdata[k]);
+    cpunet_build_block2(block2, pdata_be_loc);
 
     memcpy(data, block2, 64);
     sha256d_preextend(data);
 
     sha256_init(midstate);
-    sha256_transform_shani(midstate, pdata, 0);
+    sha256_transform_shani(midstate, pdata_be_loc, 0);
     memcpy(prehash, midstate, 32);
     sha256d_prehash(prehash, block2);
 
@@ -1812,6 +2495,10 @@ static inline int scanhash_sha256d_scalar_shani(int thr_id, uint32_t *pdata,
     } while (n < max_nonce && !work_restart[thr_id].restart);
 
     *hashes_done = n - first_nonce + 1;
+    /* Also compute single-lane midstate/prehash for self-check branch */
+    uint32_t midstate_one[8], prehash_one[8];
+    memcpy(midstate_one, (uint32_t *)midstate, 32);
+    memcpy(prehash_one, (uint32_t *)prehash, 32);
     pdata[19] = n;
     return 0;
 }

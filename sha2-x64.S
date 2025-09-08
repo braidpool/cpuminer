@@ -2974,7 +2974,6 @@ sha256d_ms_4way_avx_main_loop1:
 	vpxor	%xmm5, %xmm7, %xmm7
 	vpxor	%xmm2, %xmm3, %xmm3
 	vpxor	%xmm6, %xmm7, %xmm7
-	vpaddd	sha256d_4preext2_24(%rip), %xmm3, %xmm3
 	vpaddd	1*16(%rax), %xmm3, %xmm3
 	vpaddd	2*16(%rax), %xmm7, %xmm7
 	vmovdqa	%xmm3, 8*16(%rax)
