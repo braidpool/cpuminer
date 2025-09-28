@@ -1102,9 +1102,19 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		work->data[9 + i] = be32dec((uint32_t *)merkle_root + i);
 	work->data[17] = le32dec(sctx->job.ntime);
 	work->data[18] = le32dec(sctx->job.nbits);
-	work->data[20] = 0x80000000;
-	work->data[31] = 0x00000280;
+	//19th word will be nonce
+	//Appending `cpunet/0/0` in the header suffix for 
+	//changing the pre-image accordingly  
+	work->data[20] = 0x6370756e; 
+	work->data[21] = 0x65740000; 
 
+	work->data[22] = 0x80000000;
+	//Updating the message length after `cpunet/0/0` in the suffix  
+	work->data[31] = 0x000002c0;
+	//debug log for checking modified words 
+	for (int i = 0; i < 32; i++) {
+		applog(LOG_DEBUG, "work->data[%2d] = 0x%08x", i, work->data[i]);
+	}
 	pthread_mutex_unlock(&sctx->work_lock);
 
 	if (opt_debug) {

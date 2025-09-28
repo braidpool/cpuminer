@@ -529,10 +529,14 @@ static inline int scanhash_sha256d_4way(int thr_id, uint32_t *pdata,
 
 void sha256d_ms_8way(uint32_t *hash,  uint32_t *data,
 	const uint32_t *midstate, const uint32_t *prehash);
-
+//Scanning the hash via 8-way this is the main hash function
 static inline int scanhash_sha256d_8way(int thr_id, uint32_t *pdata,
 	const uint32_t *ptarget, uint32_t max_nonce, unsigned long *hashes_done)
 {
+	applog(LOG_DEBUG, "---- Dumping pdata ----");
+	for (int i = 0; i < 32; i++) {
+		applog(LOG_DEBUG, "pdata[%2d] = 0x%08x", i, pdata[i]);
+	}
 	uint32_t data[8 * 64] __attribute__((aligned(128)));
 	uint32_t hash[8 * 8] __attribute__((aligned(32)));
 	uint32_t midstate[8 * 8] __attribute__((aligned(32)));
@@ -547,10 +551,13 @@ static inline int scanhash_sha256d_8way(int thr_id, uint32_t *pdata,
 	for (i = 31; i >= 0; i--)
 		for (j = 0; j < 8; j++)
 			data[i * 8 + j] = data[i];
-	
+	//Initializing the keys for the corresponding midstate
 	sha256_init(midstate);
 	sha256_transform(midstate, pdata, 0);
+	//Computing the chunk0 and copy to prehash
 	memcpy(prehash, midstate, 32);
+	//Computing the chunk1 by hashing the non-static values such as 
+	//nonce etc .
 	sha256d_prehash(prehash, pdata + 16);
 	for (i = 7; i >= 0; i--) {
 		for (j = 0; j < 8; j++) {

@@ -835,7 +835,7 @@ int timeval_subtract(struct timeval *result, struct timeval *x,
 	/* Return 1 if result is negative. */
 	return x->tv_sec < y->tv_sec;
 }
-
+//Hash comparison function recieved from the downstream node
 bool fulltest(const uint32_t *hash, const uint32_t *target)
 {
 	int i;
